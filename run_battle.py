@@ -36,7 +36,8 @@ from dotenv import load_dotenv
 load_dotenv()  # przed importem ai_service (czyta konfigurację przy imporcie)
 
 from engine.client import (  # noqa: E402
-    DEFAULT_BACKEND_URL, BackendClient, BackendError, HeuristicAgent, concretize, parse_move,
+    DEFAULT_BACKEND_URL, BackendClient, BackendConfigError, BackendError, BackendUnavailableError, HeuristicAgent,
+    ModelMoveError, concretize, parse_move,
 )
 from engine.game import IllegalMoveError, TysiacGame  # noqa: E402
 
@@ -110,8 +111,12 @@ class LLMBot:
         from backend import ai_service  # import leniwy: tryb http nie wymaga litellm
         try:
             move, meta = asyncio.run(ai_service.get_move(state, self.strategy, model=self.model))
-        except Exception as exc:  # błąd modelu / dostawcy -> ruch awaryjny w pętli
-            raise BackendError(str(exc)) from exc
+        except ai_service.AIServiceError as exc:   # model nie podał poprawnego ruchu (jak HTTP 502)
+            raise ModelMoveError(str(exc)) from exc
+        except ai_service.LLMConfigError as exc:   # klucz / model / dostawca (jak HTTP 500)
+            raise BackendConfigError(str(exc)) from exc
+        except Exception as exc:                   # błąd dostawcy LLM: klucz, limit, sieć (jak HTTP 503)
+            raise BackendUnavailableError(f"{type(exc).__name__}: {exc}") from exc
         return parse_move(move.model_dump()), meta
 
 
@@ -123,15 +128,6 @@ class HeuristicBot:
 
     def choose(self, state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         return self._agent.choose(state), {"model": "heuristic", "attempts": 1, "usage": {}}
-
-
-def backend_alive(base_url: str) -> bool:
-    """GET /health – czy backend FastAPI jest uruchomiony."""
-    import requests
-    try:
-        return requests.get(base_url.rstrip("/") + "/health", timeout=5).ok
-    except requests.RequestException:
-        return False
 
 
 def load_strategy(value: str) -> str:
@@ -148,7 +144,30 @@ def load_strategy(value: str) -> str:
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     game = TysiacGame(("A", "B"), seed=args.seed)
-    client = BackendClient(args.backend, timeout=args.timeout) if args.transport == "http" else None
+    client = None
+    if args.transport == "direct":
+        import logging
+        logging.basicConfig(level=logging.INFO, format="%(message)s")
+        logging.getLogger("backend.llm").setLevel(logging.WARNING if not args.verbose else logging.INFO)
+        from backend import ai_service
+        llm = ai_service.SETTINGS
+        print(c(f"LLM (direct): {llm.provider.name} / {llm.model} | zapasowe: {', '.join(llm.fallbacks) or '-'}"
+                + (" – TRYB TESTOWY" if llm.provider.name != "meta" else ""), "32"))
+        try:
+            llm.ensure_ready()
+        except Exception as exc:  # LLMConfigError – np. brak klucza
+            raise SystemExit(c(f"\n✖ {exc}", "31"))
+    if args.transport == "http":
+        client = BackendClient(args.backend, timeout=args.timeout)
+        # Fail fast: czy backend działa i ma ten sam kontrakt (/play-turn, api_version).
+        # Lepiej przerwać przed pierwszym ruchem niż w środku partii.
+        try:
+            info = client.verify()
+        except BackendError as exc:
+            raise SystemExit(c(f"\n✖ {exc}", "31"))
+        print(c(f"Backend OK: {client.url} (API v{info['api_version']}) | LLM: {info.get('provider')} / "
+                f"{info.get('model')}" + (" – TRYB TESTOWY" if info.get("provider") not in (None, "meta") else ""),
+                "32"))
 
     def make_bot(label: str, kind: str, strategy: str, model: str | None):
         if kind == "heuristic":
@@ -172,13 +191,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             print(build_system_prompt(bot.strategy))
         else:
             print("  Strategia: " + bot.strategy.replace("\n", "\n             "))
-
-    # Tryb http: szybki test, czy backend działa – lepiej przerwać od razu niż
-    # rozegrać partię złożoną z samych ruchów awaryjnych.
-    if client is not None and not backend_alive(args.backend):
-        raise SystemExit(f"\nBackend nie odpowiada pod {args.backend}. Uruchom go w drugim terminalu:\n"
-                         f"    uvicorn backend.main:app --reload\n"
-                         f"albo użyj trybu bez serwera:  --transport direct")
 
     # buffering=1 -> zapis linia po linii (log przetrwa przerwanie partii Ctrl+C)
     log_file = open(args.log, "w", encoding="utf-8", buffering=1) if args.log else None
@@ -222,10 +234,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             move, meta = bots[player].choose(state)
             reasoning = move.pop("reasoning", "")
             game.apply_move(player, move)
-        except (BackendError, IllegalMoveError) as exc:
+        except (ModelMoveError, IllegalMoveError) as exc:
+            # Model zawiódł merytorycznie. Ruch zastępczy TYLKO na wyraźne życzenie.
+            if not args.fallback_on_model_error:
+                abort(exc, state, player, game, totals, log_file, args)
             move, meta = concretize(state["legal_moves"][0]), {}
-            reasoning, fallback = f"RUCH AWARYJNY – {str(exc)[:200]}", True
+            reasoning, fallback = f"RUCH ZASTĘPCZY – {str(exc)[:200]}", True
             game.apply_move(player, move)
+        except BackendError as exc:
+            # Połączenie, 404/422, dostawca LLM: nigdy nie gramy za bota.
+            abort(exc, state, player, game, totals, log_file, args)
         elapsed = time.perf_counter() - t0
 
         usage = meta.get("usage") or {}
@@ -262,16 +280,37 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if args.step:
             input(c("   [Enter] następny ruch…", "2"))
 
-    # --- podsumowanie ------------------------------------------------------------
+    print_summary(game, totals, log_file, args)
+    return {"winner": game.winner, "scores": game.scores, "totals": totals}
+
+
+def print_summary(game: TysiacGame, totals: dict[str, Any], log_file: Any, args: argparse.Namespace) -> None:
     print(c("\n" + "═" * 78, "1"))
     print(c(f" ZWYCIĘZCA: {game.winner or 'brak (przerwano)'}   WYNIK: {game.scores}", "1;32"))
     for p, s in totals.items():
-        print(f"   Bot {p}: ruchów {s['moves']}, awaryjnych {s['fallbacks']}, "
+        print(f"   Bot {p}: ruchów {s['moves']}, zastępczych {s['fallbacks']}, "
               f"tokenów {s['tokens']}, czas {s['seconds']:.1f}s")
     if log_file:
         log_file.close()
         print(f"   Log JSONL: {args.log}")
-    return {"winner": game.winner, "scores": game.scores, "totals": totals}
+
+
+def abort(exc: Exception, state: dict[str, Any], player: str, game: TysiacGame,
+          totals: dict[str, Any], log_file: Any, args: argparse.Namespace) -> None:
+    """Czytelne przerwanie partii: co się stało, gdzie i co zrobić. Kod wyjścia 1."""
+    print(c("\n" + "✖" * 78, "31"))
+    print(c(f" PARTIA PRZERWANA – rozdanie {state['round']}, faza '{PHASE_PL.get(state['phase'], state['phase'])}', "
+            f"ruch Bota {player}", "1;31"))
+    print(c(f" [{type(exc).__name__}] {exc}", "31"))
+    if isinstance(exc, (ModelMoveError, IllegalMoveError)):
+        print(c(" Wskazówka: dopracuj strategię w debug_sandbox.py albo uruchom z "
+                "--fallback-on-model-error.", "33"))
+    if log_file:
+        log_file.write(json.dumps({"aborted": True, "error_type": type(exc).__name__, "error": str(exc),
+                                   "round": state["round"], "phase": state["phase"], "player": player,
+                                   "state": state}, ensure_ascii=False) + "\n")
+    print_summary(game, totals, log_file, args)
+    raise SystemExit(1)
 
 
 def parse_args() -> argparse.Namespace:
@@ -279,7 +318,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("-a", "--strategy-a", default="agresywna",
                    help="Strategia bota A: plik, nazwa presetu ze strategies/ lub tekst")
     p.add_argument("-b", "--strategy-b", default="defensywna", help="Strategia bota B (j.w.)")
-    p.add_argument("--model-a", help="Model LiteLLM dla A (domyślnie LLM_MODEL z .env)")
+    p.add_argument("--model-a", help="Model dla A (domyślnie z .env: LLM_PROVIDER/LLM_MODEL); "
+                                     "bez prefiksu dostaje prefiks aktywnego dostawcy")
     p.add_argument("--model-b", help="Model LiteLLM dla B")
     p.add_argument("--bot-a", choices=["llm", "heuristic"], default="llm")
     p.add_argument("--bot-b", choices=["llm", "heuristic"], default="llm")
@@ -287,7 +327,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--backend", default=DEFAULT_BACKEND_URL, help="Adres backendu (tryb http)")
     p.add_argument("--timeout", type=float, default=180.0)
     p.add_argument("--seed", type=int, default=None, help="Ziarno tasowania (powtarzalne rozdania)")
-    p.add_argument("--max-rounds", type=int, default=None, help="Limit rozdań (kontrola kosztów)")
+    p.add_argument("--max-rounds", type=int, default=60, help="Limit rozdań (kontrola kosztów, 0 = bez limitu)")
+    p.add_argument("--fallback-on-model-error", action="store_true",
+                   help="Gdy model nie poda poprawnego ruchu: zagraj pierwszy legalny zamiast przerywać "
+                        "(błędy połączenia/API zawsze przerywają)")
     p.add_argument("--show-prompt", choices=["full", "strategy"], default="full",
                    help="Na starcie: pełny prompt systemowy czy tylko strategia")
     p.add_argument("--show-state", choices=["off", "compact", "full"], default="off",

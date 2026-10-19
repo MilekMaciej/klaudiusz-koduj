@@ -52,6 +52,7 @@ from dotenv import load_dotenv
 load_dotenv()  # przed importem ai_service (czyta konfigurację przy imporcie)
 
 from backend import ai_service  # noqa: E402
+from backend.llm_config import LLMConfigError  # noqa: E402
 from engine.game import (  # noqa: E402
     HAND_SIZE, MELD_POINTS, SUITS, Card, Phase, TysiacGame, new_deck, sort_hand,
 )
@@ -220,24 +221,25 @@ def build_game(sc: dict[str, Any]) -> TysiacGame:
 
 async def call_raw(state: dict[str, Any], strategy: str, model: str,
                    temperature: float | None) -> dict[str, Any]:
-    """Jedno surowe wywołanie LiteLLM – te same prompty i parametry co backend, bez ponowień."""
-    import litellm
-
-    kwargs: dict[str, Any] = {}
-    if ai_service.LLM_REASONING_EFFORT:
-        kwargs["reasoning_effort"] = ai_service.LLM_REASONING_EFFORT
+    """
+    Jedno surowe wywołanie modelu – te same prompty, parametry i obsługa błędów
+    dostawcy co w backendzie (ai_service.complete), ale BEZ ponowień z feedbackiem
+    i bez modeli zapasowych: testujemy dokładnie wskazany model.
+    """
+    if temperature is not None:
+        ai_service.SETTINGS.temperature = temperature
     t0 = time.perf_counter()
-    response = await litellm.acompletion(
-        model=model,
-        messages=[{"role": "system", "content": ai_service.build_system_prompt(strategy)},
-                  {"role": "user", "content": ai_service.build_user_prompt(state)}],
-        temperature=ai_service.LLM_TEMPERATURE if temperature is None else temperature,
-        timeout=ai_service.LLM_TIMEOUT,
-        response_format={"type": "json_object"},
-        **kwargs,
-    )
-    raw = response.choices[0].message.content or ""
-    usage = getattr(response, "usage", None)
+    messages = [{"role": "system", "content": ai_service.build_system_prompt(strategy)},
+                {"role": "user", "content": ai_service.build_user_prompt(state)}]
+    try:
+        result = await ai_service.complete(messages, model=model, use_fallbacks=False)
+    except ai_service.ModelOutputError as exc:
+        return {"raw": exc.raw or "", "move": None, "usage": None,
+                "verdict": {"valid_json": False, "valid_schema": False, "legal": False, "error": str(exc)},
+                "seconds": round(time.perf_counter() - t0, 2)}
+    except (LLMConfigError, ai_service.LLMUnavailableError) as exc:
+        raise SystemExit(f"\n✖ [{type(exc).__name__}] {exc}\n  Diagnostyka: python -m backend.llm_config --ping")
+    raw = result.raw
 
     verdict: dict[str, Any] = {"valid_json": False, "valid_schema": False, "legal": False}
     move = None
@@ -253,20 +255,22 @@ async def call_raw(state: dict[str, Any], strategy: str, model: str,
         "raw": raw,
         "move": move.model_dump() if move else None,
         "verdict": verdict,
-        "usage": {"prompt_tokens": getattr(usage, "prompt_tokens", None),
-                  "completion_tokens": getattr(usage, "completion_tokens", None)} if usage else None,
+        "usage": result.usage,
+        "model": result.model,
         "seconds": round(time.perf_counter() - t0, 2),
     }
 
 
 async def call_service(state: dict[str, Any], strategy: str, model: str) -> dict[str, Any]:
-    """Ścieżka produkcyjna (z ponowieniami i walidacją legalności)."""
+    """Ścieżka produkcyjna (ponowienia, modele zapasowe, walidacja legalności)."""
     t0 = time.perf_counter()
     try:
         move, meta = await ai_service.get_move(state, strategy, model=model)
         return {"move": move.model_dump(), **meta, "seconds": round(time.perf_counter() - t0, 2)}
     except ai_service.AIServiceError as exc:
         return {"error": str(exc), "seconds": round(time.perf_counter() - t0, 2)}
+    except (LLMConfigError, ai_service.LLMUnavailableError) as exc:
+        raise SystemExit(f"\n✖ [{type(exc).__name__}] {exc}\n  Diagnostyka: python -m backend.llm_config --ping")
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +314,8 @@ def main() -> None:
 
     m = p.add_argument_group("model i prompt")
     m.add_argument("--strategy", help="Prompt-strategia: plik, preset ze strategies/ lub tekst")
-    m.add_argument("--model", help=f"Model LiteLLM (domyślnie {ai_service.LLM_MODEL})")
+    m.add_argument("--model", help=f"Model LiteLLM (domyślnie {ai_service.SETTINGS.model} – dostawca "
+                                   f"{ai_service.SETTINGS.provider.name}); nazwa bez prefiksu dostaje prefiks dostawcy")
     m.add_argument("--temperature", type=float, help="Nadpisz temperaturę (tryb raw)")
     m.add_argument("--mode", choices=["raw", "service"], default="raw")
     m.add_argument("--repeat", type=int, default=1, help="Ile razy zapytać model (test stabilności)")
@@ -333,7 +338,7 @@ def main() -> None:
     game = build_game(scenario)
     state = game.get_state(BOT)
     strategy = load_strategy(scenario.get("strategy"))
-    model = args.model or ai_service.LLM_MODEL
+    model = ai_service.SETTINGS.resolve_model(args.model)
 
     section("STAN DLA BOTA (skrót)")
     brief = {k: state[k] for k in ("phase", "your_role", "hand", "table", "trump", "current_bid",
@@ -352,7 +357,7 @@ def main() -> None:
     if args.dry_run:
         return
 
-    section(f"ODPOWIEDŹ MODELU  [{model}, tryb {args.mode}]")
+    section(f"ODPOWIEDŹ MODELU  [{ai_service.SETTINGS.provider.name}: {model}, tryb {args.mode}]")
     tally: Counter[str] = Counter()
     for i in range(1, args.repeat + 1):
         if args.mode == "raw":
