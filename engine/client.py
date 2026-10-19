@@ -60,6 +60,11 @@ class BackendClient:
         Wysyła stan gry i strategię, zwraca słownik ruchu, np.:
             {"action": "play_card", "card": "10_hearts", "reasoning": "..."}
         """
+        return self.request_turn(game_state, strategy, model)[0]
+
+    def request_turn(self, game_state: dict[str, Any], strategy: str,
+                     model: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Jak `request_move`, ale zwraca też metadane backendu: (ruch, {model, attempts, usage})."""
         payload: dict[str, Any] = {"game_state": game_state, "strategy": strategy}
         if model:
             payload["model"] = model
@@ -83,7 +88,8 @@ class BackendClient:
         except (ValueError, KeyError, TypeError) as exc:
             raise BackendError(f"Nieoczekiwany format odpowiedzi: {resp.text[:500]}") from exc
 
-        return parse_move(move)
+        meta = {k: data.get(k) for k in ("model", "attempts", "usage")}
+        return parse_move(move), meta
 
 
 def parse_move(raw: dict[str, Any]) -> dict[str, Any]:

@@ -1,0 +1,11 @@
+{
+  "phase": "play",
+  "role": "bidder",
+  "contract": 140,
+  "hand": "Ah 10h Kh Qh Kc 9s",
+  "played": "Ad 9d 10d Jd Ac Jc 10s Qs",
+  "trump": null,
+  "scores": [420, 510],
+  "strategy": "agresywna",
+  "seed": 1
+}
