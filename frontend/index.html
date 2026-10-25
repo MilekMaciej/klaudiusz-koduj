@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tysiąc · Prompt Battles</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="brand-mark">♠</span> Tysiąc <span class="brand-sub">Prompt Battles</span></div>
+  <div class="topbar-info" id="llm-info">ładowanie konfiguracji…</div>
+</header>
+
+<main>
+  <!-- ====================== KONFIGURACJA MECZU ====================== -->
+  <section id="setup" class="view">
+    <div class="intro">
+      <h1>Nowy mecz</h1>
+      <p>Dwa modele grają w Tysiąca (2 graczy), sterowane wyłącznie Twoimi strategiami. Każdy bot działa
+        w osobnym kontekście i dostaje tylko to, co widziałby przy stole.</p>
+    </div>
+
+    <div class="mode-switch" role="tablist" aria-label="Tryb gry">
+      <button type="button" class="mode-btn active" data-mode="normal" role="tab" aria-selected="true">
+        <strong>Zwykła rozgrywka</strong><span>Losowe rozdania, partia do 1000 pkt</span>
+      </button>
+      <button type="button" class="mode-btn" data-mode="sandbox" role="tab" aria-selected="false">
+        <strong>Sandbox</strong><span>Ręcznie ustawione karty, stół i historia; możesz grać sam</span>
+      </button>
+    </div>
+
+    <div class="seats" id="seats"></div>
+
+    <!-- ---------- SANDBOX ---------- -->
+    <section id="sandbox-panel" class="panel" hidden>
+      <div class="panel-head">
+        <h2>Sytuacja przy stole</h2>
+        <div class="examples">
+          <span class="muted">Przykłady:</span>
+          <button type="button" class="link-btn" data-example="meld">meldunek</button>
+          <button type="button" class="link-btn" data-example="defend">obrona</button>
+          <button type="button" class="link-btn" data-example="bid">licytacja</button>
+          <button type="button" class="link-btn" data-example="clear">wyczyść</button>
+        </div>
+      </div>
+      <p class="hint">Karty zapisuj skrótem: <code>Ah 10h Kc Qd Js 9s</code> (h ♥ kier, d ♦ karo, c ♣ trefl, s ♠ pik).
+        Puste pola są dolosowywane, talia zawsze ma 24 karty. Najdłuższa podana ręka wyznacza, ile lew rozegrano.</p>
+
+      <div class="grid3">
+        <label>Faza
+          <select id="sb-phase">
+            <option value="bidding">Licytacja</option>
+            <option value="choose_musik">Wybór musiku</option>
+            <option value="discard">Odkładanie kart</option>
+            <option value="declare">Deklaracja kontraktu</option>
+            <option value="play" selected>Rozgrywka</option>
+          </select>
+        </label>
+        <label>Ruch ma
+          <select id="sb-to-move"><option>A</option><option>B</option></select>
+        </label>
+        <label>Wyniki A / B
+          <span class="pair"><input id="sb-score-a" type="number" step="10" value="0"><input id="sb-score-b" type="number" step="10" value="0"></span>
+        </label>
+      </div>
+
+      <div class="grid2">
+        <label><span class="label-row">Ręka A <span class="count" data-for="sb-hand-a"></span></span>
+          <input id="sb-hand-a" class="cards-input" placeholder="np. Ah 10h Kh Qh Kc 9s" autocomplete="off">
+          <span class="chips" data-for="sb-hand-a"></span>
+        </label>
+        <label><span class="label-row">Ręka B <span class="count" data-for="sb-hand-b"></span></span>
+          <input id="sb-hand-b" class="cards-input" placeholder="puste = losowa" autocomplete="off">
+          <span class="chips" data-for="sb-hand-b"></span>
+        </label>
+      </div>
+
+      <div class="grid3 only-phase" data-phases="bidding,choose_musik">
+        <label>Musik 1 <input id="sb-musik-1" class="cards-input" placeholder="2 karty lub puste"><span class="chips" data-for="sb-musik-1"></span></label>
+        <label>Musik 2 <input id="sb-musik-2" class="cards-input" placeholder="2 karty lub puste"><span class="chips" data-for="sb-musik-2"></span></label>
+        <label class="only-phase" data-phases="bidding">Rozdający
+          <select id="sb-dealer"><option value="">automatycznie</option><option>A</option><option>B</option></select>
+        </label>
+      </div>
+
+      <div class="grid3">
+        <label class="only-phase" data-phases="bidding">Stawka przeciwnika <input id="sb-bid" type="number" step="10" min="100" placeholder="brak = otwarcie"></label>
+        <label class="only-phase" data-phases="choose_musik,discard,declare">Wylicytowana kwota <input id="sb-bid-won" type="number" step="10" min="100" placeholder="100"></label>
+        <label class="only-phase" data-phases="discard,declare,play">Odkryty musik <input id="sb-revealed" class="cards-input" placeholder="2 karty lub puste"><span class="chips" data-for="sb-revealed"></span></label>
+      </div>
+
+      <div class="only-phase" data-phases="play">
+        <div class="grid3">
+          <label>Rozgrywający
+            <select id="sb-bidder"><option value="">= gracz z ruchem</option><option>A</option><option>B</option></select>
+          </label>
+          <label>Kontrakt <input id="sb-contract" type="number" step="10" min="100" placeholder="100"></label>
+          <label>Atut
+            <select id="sb-trump">
+              <option value="">z meldunków</option><option value="hearts">♥ kier</option><option value="diamonds">♦ karo</option>
+              <option value="clubs">♣ trefl</option><option value="spades">♠ pik</option>
+            </select>
+          </label>
+        </div>
+        <div class="grid3">
+          <label><span class="label-row">Karta na stole <small class="muted">(wyjście przeciwnika; * = meldunek)</small></span>
+            <input id="sb-table" class="cards-input" placeholder="np. Kc lub puste"><span class="chips" data-for="sb-table"></span>
+          </label>
+          <label><span class="label-row">Meldunki A <small class="muted">(bez wskazania lewy)</small></span><input id="sb-melds-a" placeholder="np. h d"></label>
+          <label>Meldunki B <input id="sb-melds-b" placeholder="np. c"></label>
+        </div>
+        <label><span class="label-row">Rozegrane lewy <small class="muted">— linia = lewa: <code>Ad 9d</code> · <code>A: Qh* 9h</code> (A wychodzi z meldunkiem) · <code>Kc Ac &gt; B</code> (wymuszony zwycięzca)</small></span>
+          <textarea id="sb-tricks" rows="4" placeholder="Ad 9d&#10;10d Jd"></textarea>
+        </label>
+      </div>
+
+      <details class="advanced">
+        <summary>Zaawansowane: dodatkowa historia (JSON)</summary>
+        <p class="hint">Lista zdarzeń, np. z poprzednich rozdań: <code>[{"round": 0, "action": "round_end", "note": "B przegrał 120"}]</code>.
+          Historia, która zdradzałaby ukryte karty, zostanie odrzucona.</p>
+        <textarea id="sb-history" rows="3" placeholder="[]"></textarea>
+      </details>
+    </section>
+
+    <section class="panel settings">
+      <label>Ziarno tasowania <input id="seed" type="number" placeholder="losowe"></label>
+      <label>Limit rozdań <input id="max-rounds" type="number" min="1" max="200" value="10"></label>
+      <div class="spacer"></div>
+      <button type="button" id="start" class="primary">Rozpocznij mecz</button>
+    </section>
+    <div id="setup-error" class="alert error" hidden></div>
+  </section>
+
+  <!-- ====================== MECZ ====================== -->
+  <section id="game" class="view" hidden>
+    <div class="game-bar">
+      <button type="button" id="back" class="ghost">← Nowy mecz</button>
+      <div class="game-meta" id="game-meta"></div>
+      <div class="scores" id="scores"></div>
+    </div>
+
+    <div id="game-error" class="alert error" hidden></div>
+    <div id="game-warnings" class="alert warn" hidden></div>
+
+    <div class="game-layout">
+      <div class="board">
+        <div class="table" id="table">
+          <div class="seat-row top" id="seat-top"></div>
+          <div class="center" id="center"></div>
+          <div class="seat-row bottom" id="seat-bottom"></div>
+        </div>
+
+        <div class="controls" id="controls">
+          <div class="bot-controls">
+            <button type="button" id="step" class="primary">Następny ruch</button>
+            <button type="button" id="auto">▶ Auto</button>
+            <label class="inline">tempo
+              <select id="speed"><option value="250">szybko</option><option value="900" selected>normalnie</option><option value="2000">wolno</option></select>
+            </label>
+            <span class="status" id="status"></span>
+          </div>
+          <div class="human-controls" id="human-controls" hidden></div>
+        </div>
+
+        <details class="panel" id="peek" hidden>
+          <summary>Co dokładnie widzi bot? <span class="muted">(ostatnie zapytanie, widok sędziego)</span></summary>
+          <div class="peek-tabs" id="peek-tabs"></div>
+          <pre id="peek-json" class="json"></pre>
+        </details>
+      </div>
+
+      <aside class="sidebar">
+        <h2>Przebieg</h2>
+        <ol class="log" id="log"></ol>
+      </aside>
+    </div>
+  </section>
+</main>
+
+<template id="seat-template">
+  <section class="panel seat">
+    <div class="seat-head">
+      <h2 class="seat-title"></h2>
+      <select class="seat-kind" aria-label="Kto gra">
+        <option value="llm">Bot LLM</option>
+        <option value="heuristic">Bot regułowy (bez API)</option>
+        <option value="human">Człowiek (formularz)</option>
+      </select>
+    </div>
+    <div class="llm-only">
+      <label>Model <select class="seat-model"></select></label>
+      <div class="strategy-source">
+        <label class="radio"><input type="radio" value="preset" checked> Gotowy preset</label>
+        <label class="radio"><input type="radio" value="custom"> Własny prompt</label>
+      </div>
+      <div class="preset-box">
+        <select class="seat-preset"></select>
+        <pre class="preset-preview"></pre>
+        <button type="button" class="link-btn copy-preset">Skopiuj do edycji jako własny prompt →</button>
+      </div>
+      <div class="custom-box" hidden>
+        <textarea class="seat-strategy" rows="9" maxlength="8000"
+          placeholder="Opisz strategię bota: jak licytować, kiedy meldować, co odkładać, jak rozgrywać…"></textarea>
+        <span class="muted counter">0 / 8000</span>
+      </div>
+    </div>
+    <p class="kind-note heuristic-only muted" hidden>Prosty bot regułowy: zero kosztów API – dobry przeciwnik do testów.</p>
+    <p class="kind-note human-only muted" hidden>Tym graczem sterujesz Ty – ruchy wybierasz w formularzu. Widzisz tylko swoje karty.</p>
+  </section>
+</template>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

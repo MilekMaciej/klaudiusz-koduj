@@ -40,6 +40,7 @@ from engine.client import (  # noqa: E402
     ModelMoveError, concretize, parse_move,
 )
 from engine.game import IllegalMoveError, TysiacGame  # noqa: E402
+from engine.visibility import audit_observation  # noqa: E402
 
 STRATEGY_DIR = Path(__file__).parent / "strategies"
 
@@ -205,6 +206,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
         player = game.current_player
         state = game.get_state(player)
+        # Anti-cheat: niezależny audyt – obserwacja nie może zawierać kart ukrytych przed graczem.
+        audit_observation(game, player, state)
 
         # --- nagłówek rozdania/fazy --------------------------------------------
         header = (state["round"], state["phase"])

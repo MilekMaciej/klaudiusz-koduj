@@ -18,11 +18,13 @@ Tryby wywołania:
                 --dry-run       tylko pokaż stan/prompty, bez wywołania modelu
 
 Karty można podawać jako kody silnika ('A_hearts') albo skrótem: Ah, 10h, Kc, 9s, Qd
-(h=kier, d=karo, c=trefl, s=pik; T = 10).
+(h=kier, d=karo, c=trefl, s=pik; T = 10). Stan buduje ten sam silnik scenariuszy co
+sandbox w interfejsie webowym (engine/scenario.py): brakujące karty są dolosowywane,
+a historia rozdania odtwarzana zgodnie z zasadami.
 
 Przykłady:
     # Bot wychodzi do lewy, ma meldunek kier – czy go zgłosi?
-    python debug_sandbox.py --hand "Ah 10h Kh Qh Kc 9s" --tricks-done 3 --contract 120
+    python debug_sandbox.py --hand "Ah 10h Kh Qh Kc 9s" --tricks-done 4 --contract 120
 
     # Przeciwnik wyszedł królem trefl, atut pik – czym bot dołoży?
     python debug_sandbox.py --hand "Ah 10c Js 9d" --table Kc --trump spades \
@@ -40,7 +42,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import random
 import sys
 import time
 from collections import Counter
@@ -53,165 +54,65 @@ load_dotenv()  # przed importem ai_service (czyta konfigurację przy imporcie)
 
 from backend import ai_service  # noqa: E402
 from backend.llm_config import LLMConfigError  # noqa: E402
-from engine.game import (  # noqa: E402
-    HAND_SIZE, MELD_POINTS, SUITS, Card, Phase, TysiacGame, new_deck, sort_hand,
-)
+from engine.scenario import ScenarioError, build_scenario  # noqa: E402
 
 BOT, OPP = "BOT", "OPP"
 STRATEGY_DIR = Path(__file__).parent / "strategies"
-SHORT_SUITS = {"h": "hearts", "d": "diamonds", "c": "clubs", "s": "spades",
-               "♥": "hearts", "♦": "diamonds", "♣": "clubs", "♠": "spades"}
 
 # Pola scenariusza (te same nazwy w CLI i w pliku JSON).
-SCENARIO_FIELDS = ("phase", "hand", "table", "trump", "role", "bid", "contract", "played",
-                   "tricks_done", "melds_bot", "melds_opp", "scores", "musik", "history",
+SCENARIO_FIELDS = ("phase", "hand", "opp_hand", "table", "trump", "role", "bid", "contract", "played",
+                   "tricks", "tricks_done", "melds_bot", "melds_opp", "scores", "musik", "history",
                    "strategy", "seed")
 
 
 # ---------------------------------------------------------------------------
-# Parsowanie kart
+# Budowa "oszukanego" stanu – wspólny silnik scenariuszy (engine/scenario.py)
 # ---------------------------------------------------------------------------
 
-def parse_card(token: str) -> Card:
-    """'A_hearts' | 'Ah' | '10h' | 'Th' | 'Q♠' -> Card."""
-    token = token.strip()
-    if "_" in token:
-        return Card.from_code(token)
-    rank, suit = token[:-1].upper(), SHORT_SUITS.get(token[-1].lower())
-    rank = "10" if rank == "T" else rank
-    if suit is None:
-        raise SystemExit(f"Nieznany kolor w karcie {token!r} (użyj h/d/c/s).")
-    return Card.from_code(f"{rank}_{suit}")
-
-
-def parse_cards(value: str | list[str] | None) -> list[Card]:
-    if not value:
-        return []
-    tokens = value if isinstance(value, list) else value.replace(",", " ").split()
-    return [parse_card(t) for t in tokens]
-
-
-def parse_suits(value: str | list[str] | None) -> list[str]:
-    if not value:
-        return []
-    items = value if isinstance(value, list) else value.replace(",", " ").split()
-    suits = [SHORT_SUITS.get(s, s) for s in items]
-    bad = [s for s in suits if s not in SUITS]
-    if bad:
-        raise SystemExit(f"Nieznany kolor meldunku: {bad}")
-    return suits
-
-
-# ---------------------------------------------------------------------------
-# Budowa "oszukanego" stanu na prawdziwym silniku
-# ---------------------------------------------------------------------------
-
-def build_game(sc: dict[str, Any]) -> TysiacGame:
+def to_spec(sc: dict[str, Any]) -> dict[str, Any]:
     """
-    Tworzy TysiacGame i nadpisuje bieżące rozdanie zgodnie ze scenariuszem.
-    Karty, których nie podano (ręka przeciwnika, musiki), są dolosowywane
-    z pozostałej części talii – tak, by talia zawsze była spójna (24 karty).
+    Tłumaczy scenariusz piaskownicy (perspektywa jednego bota: BOT vs OPP) na
+    specyfikację `engine.scenario.build_scenario` – tę samą, której używa
+    sandbox w interfejsie webowym. Bot ma zawsze ruch (to_move = BOT).
     """
-    rng = random.Random(sc.get("seed"))
-    game = TysiacGame((BOT, OPP), seed=sc.get("seed"), game_id="sandbox")
-    r = game.round
-    phase = sc.get("phase") or Phase.PLAY
-
-    hand = parse_cards(sc.get("hand"))
-    table = parse_cards(sc.get("table"))
-    played = parse_cards(sc.get("played"))
-    musik = parse_cards(sc.get("musik"))
-    if not hand:
-        raise SystemExit("Podaj rękę bota: --hand \"Ah 10h Kc ...\"")
-    if len(table) > 1:
-        raise SystemExit("W grze dwuosobowej na stole może leżeć najwyżej 1 karta (wyjście przeciwnika).")
-
-    used = hand + table + played
-    dupes = [c.code for c, n in Counter(used).items() if n > 1]
-    if dupes:
-        raise SystemExit(f"Te karty występują więcej niż raz: {dupes}")
-    # Wybrany musik to karty, które rozgrywający WZIĄŁ do ręki – mogą więc
-    # pokrywać się z ręką/zagranymi kartami; nie mogą trafić do dolosowania.
-    rest = [c for c in new_deck() if c not in used and c not in musik]
-    rng.shuffle(rest)
-
-    def take(n: int) -> list[Card]:
-        if n > len(rest):
-            raise SystemExit("Za mało kart w talii dla takiego scenariusza – sprawdź liczby kart.")
-        return [rest.pop() for _ in range(n)]
-
-    # --- liczba kart przeciwnika wynika z fazy i sytuacji przy stole -------------
-    if phase == Phase.PLAY:
-        opp_size = len(hand) - (1 if table else 0)
-    elif phase == Phase.DISCARD:
-        opp_size = HAND_SIZE
-    else:
-        opp_size = len(hand)
-    opp_hand = take(opp_size)
-
-    # --- nadpisanie stanu rozdania -----------------------------------------------
-    r.hands = {BOT: sort_hand(hand), OPP: sort_hand(opp_hand)}
-    r.dealer = OPP
-    r.taken = {BOT: [], OPP: []}
-    r.melds = {BOT: parse_suits(sc.get("melds_bot")), OPP: parse_suits(sc.get("melds_opp"))}
-    r.played = played + table
-    r.trump = SHORT_SUITS.get(sc.get("trump") or "", sc.get("trump")) or None
-    bid = sc.get("bid")
-    role = sc.get("role") or "bidder"
-    bidder = BOT if role == "bidder" else OPP
+    played = sc.get("played")
+    tricks = sc.get("tricks")
+    if not tricks and played:  # stary format: karty parami, wychodzący i zwycięzca wg zasad
+        tokens = played.replace(",", " ").split() if isinstance(played, str) else list(played)
+        if len(tokens) % 2:
+            raise ScenarioError("--played: liczba kart musi być parzysta (lewa = 2 karty).")
+        tricks = "\n".join(f"{tokens[i]} {tokens[i + 1]}" for i in range(0, len(tokens), 2))
     scores = sc.get("scores") or [0, 0]
-    game.scores = {BOT: int(scores[0]), OPP: int(scores[1])}
+    return {
+        "players": [BOT, OPP],
+        "to_move": BOT,
+        "phase": sc.get("phase") or "play",
+        "hands": {BOT: sc.get("hand"), OPP: sc.get("opp_hand")},
+        "table": sc.get("table"),
+        "trump": sc.get("trump"),
+        "bidder": OPP if sc.get("role") == "defender" else BOT,
+        "bid": sc.get("bid"),
+        "contract": sc.get("contract"),
+        "tricks": tricks,
+        "tricks_done": sc.get("tricks_done"),
+        "melds": {BOT: sc.get("melds_bot") or [], OPP: sc.get("melds_opp") or []},
+        "scores": {BOT: scores[0], OPP: scores[1]} if isinstance(scores, list) else scores,
+        "musik": sc.get("musik"),
+        "history": sc.get("history"),
+        "seed": sc.get("seed"),
+    }
 
-    def revealed_musik(owner: str) -> list[Card]:
-        """Odkryty musik: podany w scenariuszu albo 2 karty z ręki rozgrywającego."""
-        return musik or rng.sample(r.hands[owner], min(2, len(r.hands[owner])))
 
-    if phase == Phase.BIDDING:
-        r.bid, r.high_bidder = (bid, OPP) if bid else (None, None)
-        r.bid_turn = BOT
-        r.musiki = [take(2), take(2)]
-    elif phase == Phase.CHOOSE_MUSIK:
-        r.bid, r.high_bidder, r.bidder = bid or 100, BOT, BOT
-        r.musiki = [take(2), take(2)]
-    elif phase == Phase.DISCARD:          # bot ma 12 kart (10 + musik)
-        r.bid, r.high_bidder, r.bidder, r.chosen_musik = bid or 100, BOT, BOT, 0
-        r.musiki = [revealed_musik(BOT), take(2)]
-    elif phase == Phase.DECLARE:          # bot już odłożył 2 karty
-        r.bid, r.high_bidder, r.bidder, r.chosen_musik = bid or 100, BOT, BOT, 0
-        r.discards = take(2)
-        r.musiki = [revealed_musik(BOT), take(2)]
-    elif phase == Phase.PLAY:
-        contract = sc.get("contract") or bid or 100
-        r.bid = r.contract = contract
-        r.high_bidder = r.bidder = bidder
-        r.chosen_musik = 0
-        r.discards = take(2)              # odłożone karty rozgrywającego (BOT lub OPP)
-        r.musiki = [revealed_musik(bidder), take(2)]
-        r.tricks_done = int(sc["tricks_done"]) if sc.get("tricks_done") is not None else len(played) // 2
-        # Karty zagrane wcześniej trafiają do wziętych lew (rozdzielone umownie: na przemian).
-        for i in range(0, len(played) - 1, 2):
-            r.taken[BOT if (i // 2) % 2 == 0 else OPP].extend(played[i:i + 2])
-        if table:
-            r.leader, r.trick = OPP, [(OPP, table[0])]
-        else:
-            r.leader, r.trick = BOT, []
-    else:
-        raise SystemExit(f"Nieobsługiwana faza: {phase}")
-
-    game.phase = phase
-
-    # --- historia: notatka piaskownicy + ewentualne zdarzenia ze scenariusza ------
-    game._log.clear()
-    game._record(None, "sandbox_note",
-                 note="Stan przygotowany ręcznie w piaskownicy – historia może być niepełna.")
-    for ev in sc.get("history") or []:
-        game._log.append({"public": {"seq": len(game._log) + 1, **ev}, "private": {}, "owner": None})
-    for suit in r.melds[BOT] + r.melds[OPP]:
-        who = BOT if suit in r.melds[BOT] else OPP
-        game._record(who, "meld", suit=suit, points=MELD_POINTS[suit], new_trump=suit)
-
-    if not game.legal_moves(BOT):
-        raise SystemExit("W tym scenariuszu bot nie ma żadnego legalnego ruchu – sprawdź dane.")
+def build_game(sc: dict[str, Any]):
+    """Scenariusz piaskownicy -> TysiacGame (błędy jako czytelny komunikat i wyjście)."""
+    if not sc.get("hand") and (sc.get("phase") or "play") == "play" and not sc.get("tricks_done"):
+        raise SystemExit('Podaj rękę bota: --hand "Ah 10h Kc ..." (albo --tricks-done, by dolosować).')
+    try:
+        game, warnings = build_scenario(to_spec(sc), game_id="sandbox")
+    except ScenarioError as exc:
+        raise SystemExit(f"✖ Niepoprawny scenariusz: {exc}") from None
+    for w in warnings:
+        print(f"⚠ {w}")
     return game
 
 
@@ -304,7 +205,9 @@ def main() -> None:
     s.add_argument("--role", choices=["bidder", "defender"], help="Rola bota w rozdaniu (faza play)")
     s.add_argument("--bid", type=int, help="Aktualna stawka (licytacja) / wylicytowana wartość")
     s.add_argument("--contract", type=int, help="Kontrakt w fazie rozgrywki")
-    s.add_argument("--played", help="Karty zagrane wcześniej w tym rozdaniu (parami = lewy)")
+    s.add_argument("--played", help="Karty zagrane wcześniej w tym rozdaniu (parami = lewy, wychodzący wg zasad)")
+    s.add_argument("--tricks", help='Lewy, linia = lewa: "OPP: Qh* 9h\\nAh 9s > BOT" (* = meldunek)')
+    s.add_argument("--opp-hand", dest="opp_hand", help="Ręka przeciwnika (domyślnie losowa)")
     s.add_argument("--tricks-done", dest="tricks_done", type=int, help="Ile lew już rozegrano")
     s.add_argument("--melds-bot", dest="melds_bot", help="Meldunki bota w tym rozdaniu, np. 'hearts'")
     s.add_argument("--melds-opp", dest="melds_opp", help="Meldunki przeciwnika w tym rozdaniu")

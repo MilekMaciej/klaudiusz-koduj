@@ -9,7 +9,8 @@ Odpowiedzialność modułu:
          - SYSTEM PROMPT  = reguły kontraktu (format JSON) + STRATEGIA UŻYTKOWNIKA,
          - USER PROMPT    = kompletny stan gry (JSON) przygotowany przez silnik.
     2. Wywołanie modelu przez LiteLLM – dostawca i model z `llm_config.py` (.env):
-       docelowo Meta (Muse Spark), na czas testów np. darmowy Groq.
+       docelowo Meta (Muse Spark), na czas testów darmowy Groq lub Gemini Flash.
+       Każdy bot może mieć własny model (parametry dobierane per model).
     3. Odporność na awarie dostawcy: mapowanie wyjątków LiteLLM, ponowienia
        błędów przejściowych, modele zapasowe, automatyczne wyłączanie
        parametrów, których dany model nie obsługuje.
@@ -56,6 +57,10 @@ LLM_MODEL: str = SETTINGS.model
 # własny mechanizm poniżej (_disabled_params).
 litellm.drop_params = True
 litellm.suppress_debug_info = True
+# Izolacja botów: żadnego współdzielonego cache odpowiedzi między wywołaniami.
+# Każde wywołanie to osobna, jednorazowa rozmowa (system = strategia JEDNEGO bota,
+# user = obserwacja TEGO bota) – nic nie przechodzi z kontekstu Bota A do Bota B.
+litellm.cache = None
 
 
 def reload_settings() -> LLMSettings:
@@ -284,13 +289,19 @@ def _looks_like_unknown_model(message: str) -> bool:
 
 _RETRY_IN_RE = re.compile(r"try again in\s+(?:(\d+)h)?\s*(?:(\d+)m(?!s))?\s*(?:([\d.]+)s)?\s*(?:([\d.]+)ms)?",
                           re.IGNORECASE)
+#: Gemini (Google RPC RetryInfo):  "retryDelay": "37s"  /  'retryDelay': '1.5s'
+_RETRY_DELAY_RE = re.compile(r"retryDelay[\"']?\s*[:=]\s*[\"']?([\d.]+)s", re.IGNORECASE)
+#: Wyczerpany limit DOBOWY – czekanie sekundami nic nie da (Gemini podaje wtedy mylące
+#: retryDelay "1s", ale quotaId zawiera "PerDay"; Groq pisze "requests per day (RPD)").
+_DAILY_QUOTA_RE = re.compile(r"PerDay|per day|\bRPD\b|daily", re.IGNORECASE)
 
 
 def _retry_after_hint(exc: BaseException) -> float | None:
     """
     Ile sekund każe czekać dostawca. Źródła (w tej kolejności):
       1. nagłówek HTTP Retry-After (sekundy),
-      2. treść komunikatu, np. Groq: "Please try again in 7.66s" / "in 1m30.5s" / "in 450ms".
+      2. treść komunikatu, np. Groq: "Please try again in 7.66s" / "in 1m30.5s" / "in 450ms",
+      3. Gemini: pole RetryInfo "retryDelay": "37s" w treści błędu.
     """
     for headers in (getattr(getattr(exc, "response", None), "headers", None),
                     getattr(exc, "litellm_response_headers", None)):
@@ -300,10 +311,14 @@ def _retry_after_hint(exc: BaseException) -> float | None:
                 return max(0.0, float(value))
         except (TypeError, ValueError, AttributeError):
             pass
-    match = _RETRY_IN_RE.search(str(exc))
+    text = str(exc)
+    match = _RETRY_IN_RE.search(text)
     if match and any(match.groups()):
         h, m, sec, ms = match.groups()
         return (int(h or 0) * 3600 + int(m or 0) * 60 + float(sec or 0) + float(ms or 0) / 1000)
+    match = _RETRY_DELAY_RE.search(text)
+    if match:
+        return float(match.group(1))
     return None
 
 
@@ -336,8 +351,11 @@ async def complete(messages: list[dict[str, str]], model: str | None = None,
                                                                   potem model zapasowy
     """
     settings = SETTINGS
-    settings.ensure_ready()  # brak klucza/modelu -> czytelny LLMConfigError zamiast wyjątku LiteLLM
     candidates = settings.candidate_models(model) if use_fallbacks else [settings.resolve_model(model)]
+    # Brak klucza/modelu GŁÓWNEGO -> czytelny LLMConfigError zamiast wyjątku LiteLLM.
+    settings.ensure_ready(candidates[0] if candidates else None)
+    # Zapasowe bez klucza pomijamy (np. inny dostawca bez klucza w .env).
+    candidates = [candidates[0]] + [m for m in candidates[1:] if settings.key_ready(m)]
     problems: list[str] = []
     only_missing_models = True
 
@@ -349,7 +367,8 @@ async def complete(messages: list[dict[str, str]], model: str | None = None,
             kwargs = settings.call_kwargs(model_name)
             for param in _disabled_params.get(model_name, ()):
                 kwargs.pop(param, None)
-            logger.info("LLM → provider=%s model=%s%s", settings.provider.name, model_name,
+            provider_name = settings.profile_for(model_name).name
+            logger.info("LLM → provider=%s model=%s%s", provider_name, model_name,
                         "  [MODEL ZAPASOWY]" if index else "")
             try:
                 response = await litellm.acompletion(model=model_name, messages=messages, **kwargs)
@@ -357,7 +376,8 @@ async def complete(messages: list[dict[str, str]], model: str | None = None,
             except _AUTH as exc:
                 raise LLMConfigError(
                     f"Dostawca odrzucił klucz API dla {model_name} ({type(exc).__name__}). "
-                    f"Sprawdź {settings.api_key_env} w .env. Szczegóły: {_short(exc, 200)}") from exc
+                    f"Sprawdź {(settings.key_envs_for(model_name) or ('klucz',))[0]} w .env. "
+                    f"Szczegóły: {_short(exc, 200)}") from exc
 
             except _NOT_FOUND as exc:
                 logger.error("Model %s nie istnieje u dostawcy (%s).", model_name, _short(exc, 160))
@@ -384,7 +404,8 @@ async def complete(messages: list[dict[str, str]], model: str | None = None,
                 if "provider not provided" in message.lower() or "llm provider" in message.lower():
                     raise LLMConfigError(
                         f"LiteLLM nie rozpoznał dostawcy dla '{model_name}'. Podaj model z prefiksem, "
-                        f"np. groq/llama-3.3-70b-versatile albo meta/muse-spark-1.3.") from exc
+                        f"np. groq/llama-3.3-70b-versatile, gemini/gemini-flash-latest albo "
+                        f"meta/muse-spark-1.3.") from exc
                 if _looks_like_unknown_model(message):
                     logger.error("Model %s odrzucony jako nieznany (%s).", model_name, _short(exc, 160))
                     problems.append(f"{model_name}: model nie istnieje")
@@ -394,6 +415,13 @@ async def complete(messages: list[dict[str, str]], model: str | None = None,
             except _RATE_LIMIT as exc:
                 # Limit zapytań: czekamy i odpytujemy PONOWNIE TEN SAM model. Przełączenie na
                 # model zapasowy nie wchodzi w grę – zmieniałoby model w trakcie partii.
+                if _DAILY_QUOTA_RE.search(str(exc)):
+                    logger.error("Wyczerpany DOBOWY limit zapytań dla %s – ponawianie nic nie da.", model_name)
+                    raise LLMUnavailableError(
+                        f"Wyczerpany dobowy limit zapytań dostawcy '{provider_name}' dla {model_name}. "
+                        f"Limit odnowi się następnego dnia (Gemini: o północy czasu pacyficznego) – "
+                        f"do tego czasu wybierz inny model/dostawcę. Szczegóły: {_short(exc, 200)}"
+                    ) from exc
                 delay, hinted = _rate_limit_delay(exc, rate_limit_attempt, settings)
                 exhausted = rate_limit_attempt >= settings.rate_limit_retries
                 too_long = rate_limit_waited + delay > settings.rate_limit_max_wait
@@ -409,7 +437,7 @@ async def complete(messages: list[dict[str, str]], model: str | None = None,
                                   f"{settings.rate_limit_max_wait:.0f}s; przeczekano już {rate_limit_waited:.0f}s")
                     logger.error("Limit zapytań dla %s nie ustąpił: %s.", model_name, reason)
                     raise LLMUnavailableError(
-                        f"Przekroczony limit zapytań dostawcy '{settings.provider.name}' dla {model_name} "
+                        f"Przekroczony limit zapytań dostawcy '{provider_name}' dla {model_name} "
                         f"({reason}). Odczekaj chwilę i spróbuj ponownie. Szczegóły: {_short(exc, 200)}"
                     ) from exc
                 rate_limit_attempt += 1
@@ -438,7 +466,7 @@ async def complete(messages: list[dict[str, str]], model: str | None = None,
             return CompletionResult(
                 raw=response.choices[0].message.content or "",
                 model=model_name,
-                provider=settings.provider.name,
+                provider=provider_name,
                 usage={"prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
                        "completion_tokens": getattr(usage, "completion_tokens", 0) or 0},
                 fallback_used=index > 0,
@@ -446,10 +474,11 @@ async def complete(messages: list[dict[str, str]], model: str | None = None,
 
     summary = "; ".join(problems) or "brak modeli do wywołania"
     if only_missing_models:
+        profile = settings.profile_for(candidates[0]) if candidates else settings.provider
         raise LLMConfigError(
-            f"Żaden ze skonfigurowanych modeli nie jest dostępny u dostawcy '{settings.provider.name}' "
+            f"Żaden ze skonfigurowanych modeli nie jest dostępny u dostawcy '{profile.name}' "
             f"({summary}). Sprawdź LLM_MODEL / LLM_FALLBACK_MODELS"
-            + (f" – aktualna lista: {settings.provider.docs_url}" if settings.provider.docs_url else "") + ".")
+            + (f" – aktualna lista: {profile.docs_url}" if profile.docs_url else "") + ".")
     raise LLMUnavailableError(f"Dostawca LLM niedostępny po wszystkich próbach: {summary}")
 
 

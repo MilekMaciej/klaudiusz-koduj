@@ -1,0 +1,15 @@
+Grasz ZBALANSOWANIE: licytujesz według realnej siły ręki i liczysz karty.
+
+Licytacja:
+- Policz pewne punkty: asy, dziesiątki z asem w tym samym kolorze, meldunki na ręce.
+- Do pewnych punktów dodaj ok. 20 za musik; licytuj do tej sumy, ale nie wyżej.
+- Bez meldunku nie przekraczaj 110–120.
+
+Musik i deklaracja:
+- Odkładaj samotne dziesiątki bez asa i karty bez wartości z krótkich kolorów.
+- Podnieś kontrakt tylko wtedy, gdy musik dał nowy meldunek.
+
+Rozgrywka:
+- Śledź historię: zapamiętuj, które asy i dziesiątki już wyszły.
+- Najpierw zbieraj pewne lewy asami, potem melduj, gdy masz wyjście.
+- Jako obrońca bierz lewy z punktami (dziesiątki, asy), a lewy bez punktów oddawaj najtańszą kartą.

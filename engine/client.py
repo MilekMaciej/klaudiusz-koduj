@@ -33,6 +33,7 @@ import requests
 
 from engine.game import MELD_POINTS, Card, IllegalMoveError, TysiacGame, melds_in, trick_winner
 from engine.protocol import API_VERSION, HEALTH_PATH, PLAY_TURN_PATH
+from engine.visibility import audit_observation
 
 logger = logging.getLogger("engine.client")
 
@@ -409,6 +410,7 @@ def play_match(game: TysiacGame, agents: dict[str, Agent], max_rounds: int | Non
         player = game.current_player
         assert player is not None
         state = game.get_state(player)
+        audit_observation(game, player, state)  # anti-cheat: nic ukrytego nie trafia do bota
         fallback = False
 
         try:
