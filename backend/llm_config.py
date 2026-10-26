@@ -10,6 +10,7 @@ Do czasu otrzymania klucza można jedną zmienną przełączyć się na darmoweg
     LLM_PROVIDER=meta    -> meta/muse-spark-1.3            (META_API_KEY)    [docelowo]
     LLM_PROVIDER=groq    -> groq/llama-3.3-70b-versatile   (GROQ_API_KEY)    [testy, darmowy]
     LLM_PROVIDER=gemini  -> gemini/gemini-flash-latest     (GEMINI_API_KEY)  [testy, darmowy]
+    LLM_PROVIDER=openai  -> openai/gpt-5.6-terra           (OPENAI_API_KEY)  [ChatGPT, płatny]
     LLM_PROVIDER=custom  -> dowolny model LiteLLM z LLM_MODEL (+ LLM_API_KEY_ENV)
 
 `LLM_PROVIDER` wybiera model DOMYŚLNY. Parametry (klucz, temperatura, JSON mode,
@@ -30,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 
 logger = logging.getLogger("backend.llm")
@@ -52,6 +54,8 @@ class ProviderProfile:
     api_key_env: str | None                   # zmienna środowiskowa z kluczem
     default_model: str
     default_fallbacks: tuple[str, ...] = ()
+    #: Dodatkowe modele pokazywane w interfejsie (np. mocniejszy wariant).
+    extra_models: tuple[str, ...] = ()
     #: Inne nazwy zmiennej z kluczem akceptowane jako zapas (np. GOOGLE_API_KEY).
     api_key_aliases: tuple[str, ...] = ()
     supports_json_mode: bool = True
@@ -77,7 +81,7 @@ PROFILES: dict[str, ProviderProfile] = {
     # Testy: darmowy Groq – stabilny ("production") model Meta Llama + mniejszy jako zapas.
     "groq": ProviderProfile(
         name="groq", litellm_prefix="groq", api_key_env="GROQ_API_KEY",
-        default_model="groq/openai/gpt-oss-120b",
+        default_model="groq/llama-3.3-70b-versatile",
         default_fallbacks=("groq/llama-3.1-8b-instant",),
         label="Groq · Llama (darmowy)",
         docs_url="https://console.groq.com/docs/models",
@@ -98,6 +102,20 @@ PROFILES: dict[str, ProviderProfile] = {
         docs_url="https://ai.google.dev/gemini-api/docs/models",
         free_tier=True,
     ),
+    # ChatGPT – modele OpenAI (API płatne: wymaga konta z doładowanymi środkami).
+    # Rodzina GPT-5.6: sol (najmocniejszy), terra (zbalansowany), luna (najtańszy).
+    # To modele rozumujące: przyjmują reasoning_effort, a temperaturę tylko domyślną –
+    # dlatego jej nie wysyłamy. "low" wystarcza do gry w karty i ogranicza koszt.
+    "openai": ProviderProfile(
+        name="openai", litellm_prefix="openai", api_key_env="OPENAI_API_KEY",
+        default_model="openai/gpt-5.6-terra",
+        default_fallbacks=("openai/gpt-5.6-luna",),
+        extra_models=("openai/gpt-5.6-sol",),
+        default_reasoning_effort="low",
+        default_temperature=None,
+        label="OpenAI · ChatGPT (płatny)",
+        docs_url="https://platform.openai.com/docs/models",
+    ),
     # Dowolny inny model obsługiwany przez LiteLLM (np. ollama/llama3.1 lokalnie).
     "custom": ProviderProfile(
         name="custom", litellm_prefix="", api_key_env=None, default_model="",
@@ -113,6 +131,14 @@ KNOWN_PREFIXES = {"meta", "groq", "openai", "anthropic", "ollama", "openrouter",
 _PROFILE_BY_PREFIX = {p.litellm_prefix: p for p in PROFILES.values() if p.litellm_prefix}
 
 _NONE_VALUES = ("none", "-", "off", "false", "0", "brak")
+
+#: Nazwy modeli OpenAI podane bez prefiksu (gpt-5.6-terra, o3, chatgpt-…) – zawsze
+#: kierujemy je do OpenAI, niezależnie od aktywnego dostawcy. Wyjątek: otwarte gpt-oss
+#: (hostowane m.in. przez Groq – tam zapis "groq/openai/gpt-oss-120b").
+_OPENAI_BARE = re.compile(r"^(gpt-(?!oss)|chatgpt-|o\d)", re.IGNORECASE)
+
+#: Alternatywne nazwy dostawców w LLM_PROVIDER.
+_PROVIDER_ALIASES = {"google": "gemini", "chatgpt": "openai", "gpt": "openai"}
 
 
 # ---------------------------------------------------------------------------
@@ -144,10 +170,15 @@ def normalize_model(name: str, profile: ProviderProfile) -> str:
         'llama-3.3-70b-versatile'      + groq   -> 'groq/llama-3.3-70b-versatile'
         'gemini-flash-latest'          + gemini -> 'gemini/gemini-flash-latest'
         'meta-models/muse-spark-open'  + groq   -> 'groq/meta-models/muse-spark-open'
+        'gpt-5.6-luna'                 + dowolny -> 'openai/gpt-5.6-luna'
         'gemini/gemini-2.5-flash'               -> bez zmian (ma już prefiks)
     """
     name = name.strip()
-    if not name or provider_of(name) or not profile.litellm_prefix:
+    if not name or provider_of(name):
+        return name
+    if _OPENAI_BARE.match(name):
+        return f"openai/{name}"
+    if not profile.litellm_prefix:
         return name
     return f"{profile.litellm_prefix}/{name}"
 
@@ -219,6 +250,8 @@ class LLMSettings:
                     "https://aistudio.google.com/apikey).",
             "gemini": "Darmowy klucz: https://aistudio.google.com/apikey",
             "groq": "Darmowy klucz: https://console.groq.com/keys",
+            "openai": "Klucz: https://platform.openai.com/api-keys (API jest płatne – konto musi "
+                      "mieć doładowane środki).",
         }.get(self.profile_for(model).name, f"Uzupełnij {env_name} w pliku .env.")
         raise LLMConfigError(f"Brak klucza API dla {model}: zmienna {env_name} jest pusta. {hint}")
 
@@ -331,6 +364,8 @@ class LLMSettings:
             add(profile.default_model, "")
             for m in profile.default_fallbacks:
                 add(m, "lżejszy")
+            for m in profile.extra_models:
+                add(m, "mocniejszy")
         return out
 
     def describe(self) -> dict:
@@ -353,8 +388,7 @@ def load_settings() -> LLMSettings:
     """Buduje ustawienia z .env. Nie rzuca wyjątków – problemy trafiają do `warnings`."""
     warnings: list[str] = []
     provider_name = _env("LLM_PROVIDER", "meta").lower()
-    if provider_name == "google":
-        provider_name = "gemini"
+    provider_name = _PROVIDER_ALIASES.get(provider_name, provider_name)
     if provider_name not in PROFILES:
         warnings.append(f"Nieznany LLM_PROVIDER={provider_name!r} (dostępne: {', '.join(PROFILES)}). "
                         f"Używam 'meta'.")
@@ -380,6 +414,9 @@ def load_settings() -> LLMSettings:
     if temperature_env is not None and temperature_env < 1.0 and provider_of(model) == "gemini":
         warnings.append(f"LLM_TEMPERATURE={temperature_env} dla Gemini – Google zaleca dla Gemini 3 "
                         f"temperaturę 1.0 (niższa grozi pętlami). Zostaw LLM_TEMPERATURE puste.")
+    if temperature_env is not None and provider_of(model) == "openai":
+        warnings.append(f"LLM_TEMPERATURE={temperature_env} – modele rozumujące OpenAI (GPT-5.x) przyjmują "
+                        f"tylko domyślną temperaturę; jeśli model ją odrzuci, parametr zostanie wyłączony.")
 
     return LLMSettings(
         provider=profile,

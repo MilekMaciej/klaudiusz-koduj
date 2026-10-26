@@ -34,6 +34,17 @@
 
     <!-- ---------- SANDBOX ---------- -->
     <section id="sandbox-panel" class="panel" hidden>
+      <div id="visibility-box" class="visibility-box" hidden>
+        <span class="label-row"><strong>Widoczność kart dla człowieka</strong>
+          <small class="muted">(można zmienić także w trakcie gry)</small></span>
+        <div class="vis-options">
+          <label class="radio option-card"><input type="radio" name="visibility" value="classic" checked>
+            <span><b>Klasyczna</b> – ukryte karty przeciwnika, jak przy prawdziwym stole</span></label>
+          <label class="radio option-card"><input type="radio" name="visibility" value="open">
+            <span><b>Jawna</b> – otwarte karty: widzisz rękę bota, musiki i odłożone karty na bieżąco</span></label>
+        </div>
+        <p class="hint">Jawne karty widzi tylko człowiek – bot nadal dostaje wyłącznie własną obserwację.</p>
+      </div>
       <div class="panel-head">
         <h2>Sytuacja przy stole</h2>
         <div class="examples">
@@ -126,6 +137,8 @@
     <section class="panel settings">
       <label>Ziarno tasowania <input id="seed" type="number" placeholder="losowe"></label>
       <label>Limit rozdań <input id="max-rounds" type="number" min="1" max="200" value="10"></label>
+      <label class="radio analysis-toggle"><input type="checkbox" id="analysis" checked>
+        <span><b>Analiza ruchów solverem C++</b><br><small class="muted" id="solver-status">sprawdzam solver…</small></span></label>
       <div class="spacer"></div>
       <button type="button" id="start" class="primary">Rozpocznij mecz</button>
     </section>
@@ -137,6 +150,7 @@
     <div class="game-bar">
       <button type="button" id="back" class="ghost">← Nowy mecz</button>
       <div class="game-meta" id="game-meta"></div>
+      <button type="button" id="toggle-open" class="ghost" hidden>👁 Karty jawne</button>
       <div class="scores" id="scores"></div>
     </div>
 
@@ -172,6 +186,7 @@
 
       <aside class="sidebar">
         <h2>Przebieg</h2>
+        <div class="quality" id="quality" hidden></div>
         <ol class="log" id="log"></ol>
       </aside>
     </div>

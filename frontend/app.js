@@ -27,6 +27,7 @@ const app = {
   presets: [], models: [], defaultModel: null, mode: "normal",
   matchId: null, token: null, human: null, viewer: "spectator",
   view: null, auto: false, busy: false, peek: "A",
+  solver: null, pollTimer: null, logLen: 0,
 };
 
 /* ---------------------------------------------------------------- narzędzia */
@@ -133,6 +134,15 @@ async function initSetup() {
     $("#llm-info").textContent = "Nie udało się pobrać konfiguracji serwera.";
     showSetupError(`Serwer nie odpowiada: ${e.message}`);
   }
+  try {
+    app.solver = await api("/api/solver");
+  } catch (_) { app.solver = { available: false, reason: "brak odpowiedzi serwera" }; }
+  const analysisBox = $("#analysis");
+  analysisBox.disabled = !app.solver.available;
+  analysisBox.checked = app.solver.available;
+  $("#solver-status").textContent = app.solver.available
+    ? `Q i strata każdego ruchu w rozgrywce (double-dummy, ${app.solver.samples} światów)`
+    : `niedostępna: ${app.solver.reason}`;
   buildSeat("A", { preset: "agresywna" });
   buildSeat("B", { preset: "defensywna" });
 
@@ -151,6 +161,13 @@ function setMode(mode) {
     b.setAttribute("aria-selected", String(b.dataset.mode === mode));
   });
   $("#sandbox-panel").hidden = mode !== "sandbox";
+  updateVisibilityBox();
+}
+
+/** Wybór widoczności kart ma sens tylko w sandboxie z człowiekiem. */
+function updateVisibilityBox() {
+  const anyHuman = $$(".seat-kind").some((s) => s.value === "human");
+  $("#visibility-box").hidden = !(app.mode === "sandbox" && anyHuman);
 }
 
 function buildSeat(player, { preset }) {
@@ -196,6 +213,7 @@ function buildSeat(player, { preset }) {
 }
 
 function syncSeat(node) {
+  updateVisibilityBox();
   const kind = $(".seat-kind", node).value;
   const source = $(".strategy-source input:checked", node).value;
   $(".llm-only", node).hidden = kind !== "llm";
@@ -303,6 +321,8 @@ async function startMatch() {
     seats: { A: collectSeat("A"), B: collectSeat("B") },
     seed: $("#seed").value === "" ? null : Number($("#seed").value),
     max_rounds: Number($("#max-rounds").value) || 10,
+    analysis: $("#analysis").checked && !$("#analysis").disabled,
+    open_cards: !$("#visibility-box").hidden && $("input[name=visibility]:checked").value === "open",
   };
   try {
     if (app.mode === "sandbox") payload.sandbox = collectSandbox();
@@ -420,7 +440,13 @@ function renderGame() {
     el("span", { class: "tag", text: `rozdanie ${v.round}${v.max_rounds ? ` / ${v.max_rounds}` : ""}` }),
     el("span", { class: "tag", text: PHASE_PL[v.phase] || v.phase }),
     v.human ? el("span", { class: "tag", text: `grasz jako ${v.human}` }) : el("span", { class: "tag", text: "widok sędziego" }),
+    v.human ? el("span", { class: `tag${v.open_cards ? " accent" : ""}`, text: v.open_cards ? "karty jawne" : "karty ukryte" }) : null,
   );
+  const toggle = $("#toggle-open");
+  toggle.hidden = !(v.mode === "sandbox" && v.human);
+  toggle.classList.toggle("on", Boolean(v.open_cards));
+  toggle.textContent = v.open_cards ? "👁 Karty jawne · ukryj" : "👁 Pokaż karty przeciwnika";
+  toggle.title = "Sandbox: przełącz widoczność kart (Jawna / Klasyczna). Bot zawsze widzi tylko swoje karty.";
   const lead = Math.max(...Object.values(v.scores));
   $("#scores").replaceChildren(...["A", "B"].map((p) => el("div", { class: `score${v.scores[p] === lead && lead > 0 ? " leading" : ""}` },
     el("span", { text: seatName(v, p) }), el("b", { text: v.scores[p] }))));
@@ -440,8 +466,71 @@ function renderGame() {
 
   renderHumanControls(v, obs);
   renderPeek(v, judge);
+  renderQuality(v);
   renderLog(v);
   renderStatus();
+  schedulePoll();
+}
+
+/** Wyniki solvera liczą się w tle – odświeżaj widok, dopóki jakaś analiza trwa. */
+function schedulePoll() {
+  clearTimeout(app.pollTimer);
+  const v = app.view;
+  if (!v || !v.log.some((e) => e.analysis && e.analysis.status === "pending")) return;
+  app.pollTimer = setTimeout(async () => {
+    const typing = document.activeElement && $("#human-controls").contains(document.activeElement);
+    if (app.busy || !app.matchId || typing) { schedulePoll(); return; }
+    try {
+      app.view = await api(`/api/matches/${app.matchId}?viewer=${app.viewer}`, { token: app.token });
+      renderGame();
+    } catch (_) { /* kolejna próba przy następnym ruchu */ }
+  }, 1000);
+}
+
+function renderQuality(v) {
+  const box = $("#quality");
+  if (!v.analysis_enabled) {
+    box.hidden = !(v.solver === null && app.solver && !app.solver.available);
+    if (!box.hidden) box.replaceChildren(el("div", { class: "note", text: `Analiza solverem niedostępna: ${app.solver.reason}` }));
+    return;
+  }
+  box.hidden = false;
+  const rows = ["A", "B"].map((p) => {
+    const s = v.analysis_summary[p];
+    const text = s.analysed
+      ? `śr. strata ${s.avg_loss.toFixed(1)} · optymalne ${s.optimal}/${s.analysed}`
+      : "brak ocenionych ruchów";
+    return el("div", { class: "row" }, el("span", { text: seatName(v, p) }),
+      el("b", { text: text + (s.pending ? ` · liczę ${s.pending}` : "") }));
+  });
+  box.replaceChildren(el("div", { class: "note", text: "Jakość ruchów w rozgrywce wg solvera C++ (double-dummy):" }), ...rows);
+}
+
+const sameMove = (a, b) => a && b && a.card === b.card && a.action === b.action;
+const moveLabel = (m) => cardLabel(m.card) + (m.action === "meld" ? " +meld" : "");
+const fmtQ = (n) => (n > 0 ? "+" : "") + n.toFixed(1);
+const Q_HELP = "Q = średnia wartość rozdania (wynik rozgrywającego − obrońcy, z perspektywy gracza) przy " +
+  "optymalnej grze double-dummy, w losowych układach kart zgodnych z tym, co gracz wiedział. " +
+  "Strata = max Q − Q zagranego ruchu.";
+
+function renderAnalysis(a) {
+  if (!a) return null;
+  if (a.status === "pending") return el("div", { class: "analysis" }, el("div", { class: "line" }, el("span", { class: "badge wait", text: "⏳ solver liczy…" })));
+  if (a.status === "hidden") return el("div", { class: "analysis" }, el("div", { class: "line" }, el("span", { class: "badge wait", text: "analiza ukryta do końca rozdania" })));
+  if (a.status !== "done") return el("div", { class: "analysis muted", text: `analiza niedostępna: ${a.message || a.status}` });
+  const loss = a.loss ?? 0;
+  const cls = loss < 0.5 ? "ok" : loss < 10 ? "mid" : "bad";
+  const line = el("div", { class: "line", title: Q_HELP },
+    el("span", { class: `badge ${cls}`, text: loss < 0.5 ? "✓ optymalny" : `strata ${loss.toFixed(1)}` }),
+    el("span", { text: `Q ${fmtQ(a.q)}` }),
+    loss >= 0.5 ? el("span", { text: `· najlepszy ${moveLabel(a.best)} (Q ${fmtQ(a.max_q)})` }) : null);
+  const table = el("table", { class: "qtable" }, a.moves.map((m) => el("tr", {
+    class: [sameMove(m, a.model) && "played", sameMove(m, a.best) && "best"].filter(Boolean).join(" ") || null,
+  }, el("td", { class: cardParts(m.card).red ? "red" : null, text: moveLabel(m) }),
+     el("td", { text: `Q ${fmtQ(m.q)}` }), el("td", { class: "muted", text: `±${m.se.toFixed(1)}` }),
+     el("td", { text: a.max_q - m.q < 0.05 ? "–" : `−${(a.max_q - m.q).toFixed(1)}` }))));
+  return el("div", { class: "analysis" }, line,
+    el("details", {}, el("summary", { text: `Q wszystkich ruchów (${a.worlds} światów, ${Math.round(a.solver_ms)} ms)` }), table));
 }
 
 function renderSeat(v, p, judge, obs, position) {
@@ -455,14 +544,16 @@ function renderSeat(v, p, judge, obs, position) {
     seat.preset ? el("span", { class: "pill", text: `preset: ${seat.preset}` }) : null,
     pub.bid_winner === p && pub.contract ? el("span", { class: "pill", text: `rozgrywający · ${pub.contract}` }) : null,
     isTurn ? el("span", { class: "pill turn", text: "ma ruch" }) : null,
-    judge && seat.kind !== "human" ? el("span", { class: "judge", text: "karty widoczne tylko dla sędziego" }) : null,
+    judge && seat.kind !== "human"
+      ? el("span", { class: "judge", text: v.human ? "karty jawne (sandbox) – bot o tym nie wie" : "karty widoczne tylko dla sędziego" })
+      : null,
   );
 
   let cards;
-  if (judge) {
-    cards = judge.hands[p].map((c) => cardEl(c));
-  } else if (obs && p === v.human) {
+  if (obs && p === v.human) {
     cards = renderHumanHand(v, obs);
+  } else if (judge) {
+    cards = judge.hands[p].map((c) => cardEl(c));
   } else {
     cards = Array.from({ length: pub.hand_sizes[p] }, () => cardEl(null));
   }
@@ -598,13 +689,16 @@ function renderLog(v) {
       el("div", { class: "where", text: `R${e.round} · ${PHASE_PL[e.phase] || e.phase}` }),
       el("div", {}, el("span", { class: "who", text: `${seatName(v, e.player)}: ` }), e.text),
       e.reasoning ? el("div", { class: "why", text: e.reasoning.startsWith("(") ? e.reasoning : `„${e.reasoning}”` }) : null,
+      renderAnalysis(e.analysis),
       el("div", { class: "meta", text: meta })));
   }
   if (lastRound !== null && lastRound !== v.round) pushResult(lastRound);
   if (["finished", "round_limit"].includes(v.status) && lastRound === v.round) pushResult(lastRound);
   if (!items.length) items.push(el("li", { class: "empty", text: "Jeszcze nikt nie wykonał ruchu." }));
+  const nearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 60;
   list.replaceChildren(...items);
-  list.scrollTop = list.scrollHeight;
+  if (nearBottom || v.log.length !== app.logLen) list.scrollTop = list.scrollHeight;   // nie przewijaj, gdy czytasz starsze wpisy
+  app.logLen = v.log.length;
 }
 
 function signed(n) { return n > 0 ? `+${n}` : String(n); }
@@ -641,8 +735,16 @@ $("#auto").addEventListener("click", () => {
   renderStatus();
   if (app.auto) runAuto();
 });
+$("#toggle-open").addEventListener("click", async () => {
+  if (!app.view) return;
+  try {
+    app.view = await api(`/api/matches/${app.matchId}/visibility`, { method: "POST", token: app.token, body: { open: !app.view.open_cards } });
+    renderGame();
+  } catch (e) { showGameError({ kind: "http", message: e.message }); }
+});
 $("#back").addEventListener("click", () => {
   stopAuto();
+  clearTimeout(app.pollTimer);
   if (app.matchId) api(`/api/matches/${app.matchId}`, { method: "DELETE" }).catch(() => {});
   Object.assign(app, { matchId: null, token: null, human: null, view: null });
   $("#game").hidden = true;

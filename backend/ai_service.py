@@ -9,7 +9,8 @@ Odpowiedzialność modułu:
          - SYSTEM PROMPT  = reguły kontraktu (format JSON) + STRATEGIA UŻYTKOWNIKA,
          - USER PROMPT    = kompletny stan gry (JSON) przygotowany przez silnik.
     2. Wywołanie modelu przez LiteLLM – dostawca i model z `llm_config.py` (.env):
-       docelowo Meta (Muse Spark), na czas testów darmowy Groq lub Gemini Flash.
+       docelowo Meta (Muse Spark), na czas testów darmowy Groq lub Gemini Flash,
+       opcjonalnie ChatGPT (OpenAI).
        Każdy bot może mieć własny model (parametry dobierane per model).
     3. Odporność na awarie dostawcy: mapowanie wyjątków LiteLLM, ponowienia
        błędów przejściowych, modele zapasowe, automatyczne wyłączanie
@@ -294,6 +295,8 @@ _RETRY_DELAY_RE = re.compile(r"retryDelay[\"']?\s*[:=]\s*[\"']?([\d.]+)s", re.IG
 #: Wyczerpany limit DOBOWY – czekanie sekundami nic nie da (Gemini podaje wtedy mylące
 #: retryDelay "1s", ale quotaId zawiera "PerDay"; Groq pisze "requests per day (RPD)").
 _DAILY_QUOTA_RE = re.compile(r"PerDay|per day|\bRPD\b|daily", re.IGNORECASE)
+#: OpenAI: brak środków na koncie też przychodzi jako 429 – to błąd konfiguracji, nie limit.
+_NO_CREDITS_RE = re.compile(r"insufficient_quota|billing_hard_limit", re.IGNORECASE)
 
 
 def _retry_after_hint(exc: BaseException) -> float | None:
@@ -404,8 +407,8 @@ async def complete(messages: list[dict[str, str]], model: str | None = None,
                 if "provider not provided" in message.lower() or "llm provider" in message.lower():
                     raise LLMConfigError(
                         f"LiteLLM nie rozpoznał dostawcy dla '{model_name}'. Podaj model z prefiksem, "
-                        f"np. groq/llama-3.3-70b-versatile, gemini/gemini-flash-latest albo "
-                        f"meta/muse-spark-1.3.") from exc
+                        f"np. groq/llama-3.3-70b-versatile, gemini/gemini-flash-latest, "
+                        f"openai/gpt-5.6-terra albo meta/muse-spark-1.3.") from exc
                 if _looks_like_unknown_model(message):
                     logger.error("Model %s odrzucony jako nieznany (%s).", model_name, _short(exc, 160))
                     problems.append(f"{model_name}: model nie istnieje")
@@ -415,6 +418,11 @@ async def complete(messages: list[dict[str, str]], model: str | None = None,
             except _RATE_LIMIT as exc:
                 # Limit zapytań: czekamy i odpytujemy PONOWNIE TEN SAM model. Przełączenie na
                 # model zapasowy nie wchodzi w grę – zmieniałoby model w trakcie partii.
+                if _NO_CREDITS_RE.search(str(exc)):
+                    raise LLMConfigError(
+                        f"Konto dostawcy '{provider_name}' nie ma środków na wywołanie {model_name} "
+                        f"(insufficient_quota). Doładuj konto (OpenAI: Settings → Billing) albo wybierz "
+                        f"darmowego dostawcę (Groq / Gemini). Szczegóły: {_short(exc, 160)}") from exc
                 if _DAILY_QUOTA_RE.search(str(exc)):
                     logger.error("Wyczerpany DOBOWY limit zapytań dla %s – ponawianie nic nie da.", model_name)
                     raise LLMUnavailableError(

@@ -293,3 +293,38 @@ button.ghost { background: transparent; }
   .card { width: 44px; height: 64px; }
   .card .suit { font-size: 1.2rem; }
 }
+
+/* ---------- widoczność kart (sandbox) ---------- */
+.visibility-box { margin-bottom: 14px; padding-bottom: 14px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; }
+.vis-options { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.option-card { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; align-items: flex-start; background: var(--surface-2); }
+.option-card:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.option-card input { margin-top: 3px; }
+.analysis-toggle { width: auto !important; max-width: 340px; align-items: flex-start; }
+.analysis-toggle input { margin-top: 4px; }
+#toggle-open.on { background: var(--legal); border-color: var(--legal); color: #2b2000; }
+
+/* ---------- analiza solvera ---------- */
+.quality { margin-top: 10px; display: grid; gap: 6px; font-size: .82rem; }
+.quality .row { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; padding: 6px 8px; border-radius: 6px; background: var(--surface-2); }
+.quality .row b { font-variant-numeric: tabular-nums; }
+.quality .note { color: var(--muted); font-size: .76rem; }
+.analysis { margin-top: 4px; font-size: .78rem; display: flex; flex-direction: column; gap: 3px; }
+.analysis .line { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.badge { font: 700 .72rem var(--mono); padding: 1px 6px; border-radius: 999px; border: 1px solid; white-space: nowrap; }
+.badge.ok { color: #1d6b3f; background: #dff3e6; border-color: #9bd2ae; }
+.badge.mid { color: #7a5200; background: #fff1cf; border-color: #e8c763; }
+.badge.bad { color: #9b241b; background: #fde6e3; border-color: #e39b93; }
+.badge.wait { color: var(--muted); background: var(--surface-2); border-color: var(--border); font-weight: 500; }
+@media (prefers-color-scheme: dark) {
+  .badge.ok { color: #8fe0ad; background: #17331f; border-color: #2f6a43; }
+  .badge.mid { color: #f2cd6b; background: #3a3018; border-color: #7b6526; }
+  .badge.bad { color: #f3a49b; background: #3d1f1c; border-color: #84413a; }
+}
+.analysis details summary { cursor: pointer; color: var(--muted); }
+.qtable { border-collapse: collapse; margin-top: 4px; font-family: var(--mono); font-size: .74rem; }
+.qtable td { padding: 1px 8px 1px 0; }
+.qtable tr.played td { font-weight: 700; }
+.qtable tr.best td:first-child::after { content: " ★"; color: var(--accent); }
+.qtable .red { color: var(--red); }
+@media (max-width: 720px) { .vis-options { grid-template-columns: 1fr; } }

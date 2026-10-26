@@ -18,6 +18,7 @@ Przykłady:
     python run_battle.py -a strategies/agresywna.txt -b "Graj zachowawczo."
     python run_battle.py --transport direct --max-rounds 2 --show-state compact
     python run_battle.py --bot-b heuristic --step          # LLM vs bot regułowy, krok po kroku
+    python run_battle.py --transport direct --analyse      # + ocena ruchów solverem C++ (Q / strata)
 """
 
 from __future__ import annotations
@@ -131,6 +132,21 @@ class HeuristicBot:
         return self._agent.choose(state), {"model": "heuristic", "attempts": 1, "usage": {}}
 
 
+def analysis_input(game: TysiacGame, player: str, move: dict[str, Any], args: argparse.Namespace):
+    """Wejście solvera C++ dla ruchu w rozgrywce (tylko z --analyse)."""
+    if not args.analyse or game.phase != "play" or move.get("action") not in ("play_card", "meld"):
+        return None
+    from backend.analysis import SOLVER
+    from engine.solver_bridge import build_q_input
+    if not SOLVER.available:
+        return None
+    try:
+        return (build_q_input(game, player, move, samples=SOLVER.samples),
+                build_q_input(game, player, move, samples=SOLVER.samples, use_voids=False))
+    except ValueError:
+        return None
+
+
 def load_strategy(value: str) -> str:
     """Ścieżka do pliku, nazwa presetu ze strategies/ albo dosłowny tekst strategii."""
     for path in (Path(value), STRATEGY_DIR / value, STRATEGY_DIR / f"{value}.txt"):
@@ -233,9 +249,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         # --- decyzja bota --------------------------------------------------------
         t0 = time.perf_counter()
         fallback = False
+        q_input = None
         try:
             move, meta = bots[player].choose(state)
             reasoning = move.pop("reasoning", "")
+            q_input = analysis_input(game, player, move, args)   # PRZED ruchem (wiedza z chwili decyzji)
             game.apply_move(player, move)
         except (ModelMoveError, IllegalMoveError) as exc:
             # Model zawiódł merytorycznie. Ruch zastępczy TYLKO na wyraźne życzenie.
@@ -262,10 +280,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
               + c(f"({meta.get('attempts', '-')} próba/y, {tokens} tok, {elapsed:.1f}s)", "2"))
         if reasoning:
             print(c(f"   💬 {reasoning}", "3"))
+        analysis = None
+        if q_input and not fallback:
+            from backend.analysis import SOLVER
+            analysis = SOLVER.analyse(*q_input)
+            if analysis.get("status") == "done":
+                loss = analysis["loss"]
+                stats.setdefault("losses", []).append(loss)
+                color = "32" if loss < 0.5 else ("33" if loss < 10 else "31")
+                best = "" if loss < 0.5 else f" · najlepszy {card(analysis['best']['card'])} (Q {analysis['max_q']:+.1f})"
+                print(c(f"   📊 solver: {'optymalny' if loss < 0.5 else f'strata {loss:.1f}'} · Q {analysis['q']:+.1f}{best}", color))
+            else:
+                print(c(f"   📊 solver: {analysis.get('message') or analysis.get('status')}", "2"))
 
         if log_file:
             log_file.write(json.dumps({"state": state, "move": move, "reasoning": reasoning,
-                                       "meta": meta, "fallback": fallback, "seconds": elapsed},
+                                       "meta": meta, "fallback": fallback, "seconds": elapsed,
+                                       "analysis": analysis},
                                       ensure_ascii=False) + "\n")
 
         # --- zdarzenia jawne po ruchu (lewa, koniec rozdania) ---------------------
@@ -293,6 +324,10 @@ def print_summary(game: TysiacGame, totals: dict[str, Any], log_file: Any, args:
     for p, s in totals.items():
         print(f"   Bot {p}: ruchów {s['moves']}, zastępczych {s['fallbacks']}, "
               f"tokenów {s['tokens']}, czas {s['seconds']:.1f}s")
+        if s.get("losses"):
+            losses = s["losses"]
+            print(f"          solver: śr. strata {sum(losses) / len(losses):.2f} · "
+                  f"optymalne {sum(x < 0.5 for x in losses)}/{len(losses)} · najgorszy ruch {max(losses):.1f}")
     if log_file:
         log_file.close()
         print(f"   Log JSONL: {args.log}")
@@ -341,6 +376,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("-v", "--verbose", action="store_true", help="Pokazuj też wyniki każdej lewy")
     p.add_argument("--step", action="store_true", help="Pauza (Enter) po każdym ruchu")
     p.add_argument("--log", help="Zapisz każdą turę (stan, ruch, reasoning) do pliku JSONL")
+    p.add_argument("--analyse", action="store_true",
+                   help="Oceniaj ruchy w rozgrywce solverem C++ (Q, strata względem najlepszego ruchu)")
     p.add_argument("--no-color", action="store_true")
     return p.parse_args()
 

@@ -45,6 +45,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException  # noqa
 
 from backend import ai_service  # noqa: E402
 from backend.ai_service import AIServiceError, LLMMove, LLMUnavailableError  # noqa: E402
+from backend.analysis import SOLVER  # noqa: E402
 from backend.arena import ArenaError, ArenaService  # noqa: E402
 from backend.llm_config import LLMConfigError  # noqa: E402
 from engine.protocol import API_VERSION, HEALTH_PATH, PLAY_TURN_PATH  # noqa: E402  (wspólny kontrakt)
@@ -59,8 +60,10 @@ arena = ArenaService()
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Przy starcie serwera: baner z aktywnym dostawcą i modelem LLM."""
+    """Przy starcie serwera: baner z aktywnym dostawcą i modelem LLM + stan solvera C++."""
     ai_service.log_active_config()
+    SOLVER.prepare()            # w razie potrzeby kompiluje solver (python -m solver.build)
+    SOLVER.log_status()
     logger.info("Interfejs webowy: http://127.0.0.1:8000/")
     yield
 
@@ -230,9 +233,16 @@ async def models() -> dict[str, Any]:
     return arena.models()
 
 
+@app.get("/api/solver")
+async def solver_status() -> dict[str, Any]:
+    """Czy solver C++ (analiza Q / strata) jest dostępny i z jakimi parametrami działa."""
+    return arena.solver_status()
+
+
 @app.post("/api/matches")
 async def create_match(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    """Nowy mecz: {mode: normal|sandbox, seats: {A: {...}, B: {...}}, seed, max_rounds, sandbox}."""
+    """Nowy mecz: {mode: normal|sandbox, seats: {A: {...}, B: {...}}, seed, max_rounds, sandbox,
+    open_cards (sandbox z człowiekiem), analysis (solver C++)}."""
     return arena.create(payload)
 
 
@@ -255,6 +265,13 @@ async def match_human_move(match_id: str, payload: dict[str, Any] = Body(...),
                            x_player_token: str | None = Header(default=None)) -> dict[str, Any]:
     """Ruch gracza-człowieka: {"move": {"action": "play_card", "card": "A_hearts"}}."""
     return arena.human_move(match_id, x_player_token, payload.get("move") or {})
+
+
+@app.post("/api/matches/{match_id}/visibility")
+async def match_visibility(match_id: str, payload: dict[str, Any] = Body(...),
+                           x_player_token: str | None = Header(default=None)) -> dict[str, Any]:
+    """Sandbox z człowiekiem: {"open": true} = karty jawne, {"open": false} = klasycznie (ukryte)."""
+    return arena.set_open_cards(match_id, x_player_token, bool(payload.get("open")))
 
 
 @app.delete("/api/matches/{match_id}")

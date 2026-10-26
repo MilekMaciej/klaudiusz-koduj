@@ -20,12 +20,24 @@ Każdy gracz-bot ma własny `BotChannel` – osobny, niepołączony kontekst:
   * uzasadnienia (reasoning) bota nigdy nie trafiają do historii gry, więc
     przeciwnik ich nie widzi.
 
+Analiza ruchów (solver C++)
+---------------------------
+Każdy ruch w rozgrywce (bota i człowieka) jest w tle oceniany solverem double-dummy
+(`backend/analysis.py`): Q zagranego ruchu, najlepszy ruch, max Q i strata (LOSS).
+Solver dostaje wyłącznie wiedzę gracza z chwili decyzji. Wyniki nigdy nie trafiają
+do botów. Człowiek nie widzi analizy ruchów bota z trwającego rozdania (lista
+ocenionych alternatyw zdradzałaby karty bota) – chyba że gra z jawnymi kartami.
+
 Gracz-człowiek
 --------------
 Mecz może mieć najwyżej jednego człowieka. Przy tworzeniu meczu dostaje on
 tajny token; tylko z nim może wykonać ruch i zobaczyć SWOJĄ rękę. Widok
 sędziego (obie ręce, obserwacje botów) jest niedostępny, dopóki w meczu
 gra człowiek i partia trwa – inaczej można by podejrzeć karty bota.
+
+Wyjątek: w sandboxie człowiek może świadomie wybrać tryb "jawny" (otwarte karty) –
+wtedy jego widok zawiera wszystko, co widzi sędzia (do analizy i testów strategii).
+Boty nadal dostają wyłącznie własne obserwacje.
 """
 
 from __future__ import annotations
@@ -38,6 +50,7 @@ import re
 import secrets
 import time
 import uuid
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -46,10 +59,12 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from backend import ai_service
 from backend.ai_service import AIServiceError, LLMUnavailableError
+from backend.analysis import SOLVER
 from backend.llm_config import LLMConfigError
 from engine.client import HeuristicAgent
 from engine.game import MELD_POINTS, IllegalMoveError, Phase, TysiacGame
 from engine.scenario import ScenarioError, build_scenario
+from engine.solver_bridge import build_q_input
 from engine.visibility import InformationLeakError, audit_observation
 
 logger = logging.getLogger("backend.arena")
@@ -120,6 +135,10 @@ class CreateMatchRequest(BaseModel):
     seed: int | None = None
     max_rounds: int | None = Field(default=10, ge=1, le=200)
     sandbox: dict[str, Any] | None = None
+    #: Sandbox z człowiekiem: True = karty jawne (człowiek widzi karty przeciwnika).
+    open_cards: bool = False
+    #: Analiza ruchów solverem C++ (Q / strata) w tle.
+    analysis: bool = True
 
     @field_validator("seats")
     @classmethod
@@ -218,6 +237,8 @@ class Match:
     max_rounds: int | None
     human: str | None = None
     human_token: str | None = None
+    open_cards: bool = False
+    analysis: bool = False
     warnings: list[str] = field(default_factory=list)
     log: list[dict[str, Any]] = field(default_factory=list)
     status: str = "running"
@@ -283,12 +304,13 @@ class Match:
                 return
 
             reasoning = str(move.pop("reasoning", "") or "")
+            solver_inputs = self._solver_inputs(player, move)   # PRZED ruchem: stan z chwili decyzji
             try:
                 g.apply_move(player, move)
             except IllegalMoveError as exc:
                 self._set_error("illegal_move", f"Silnik odrzucił ruch {move}: {exc}", player, observation)
                 return
-            self._record(player, observation, move, reasoning, meta)
+            self._record(player, observation, move, reasoning, meta, solver_inputs)
             self.last_error = None
             self._refresh_status()
 
@@ -302,16 +324,40 @@ class Match:
             raise ArenaError(409, f"Teraz ruch ma {g.current_player}, nie Ty.")
         move = {k: v for k, v in move.items() if k in ("action", "card", "value")}
         observation = g.get_state(self.human)
+        legal = any(g.move_matches(move, lm) for lm in g.legal_moves(self.human))
+        solver_inputs = self._solver_inputs(self.human, move) if legal else None
         try:
             g.apply_move(self.human, move)
         except IllegalMoveError as exc:
             raise ArenaError(400, f"Niedozwolony ruch: {exc}") from None
         self.touched = time.time()
-        self._record(self.human, observation, move, "", {"provider": "human", "model": "człowiek"})
+        self._record(self.human, observation, move, "", {"provider": "human", "model": "człowiek"}, solver_inputs)
         self._refresh_status()
 
+    def set_open_cards(self, token: str | None, value: bool) -> None:
+        """Przełącznik jawnych kart w trakcie gry (tylko sandbox z człowiekiem)."""
+        if self.mode != "sandbox" or not self.human:
+            raise ArenaError(400, "Jawne karty są dostępne tylko w sandboxie z graczem-człowiekiem.")
+        if not token or not secrets.compare_digest(token, self.human_token or ""):
+            raise ArenaError(403, "Niepoprawny token gracza.")
+        self.open_cards = bool(value)
+
+    # --- analiza solverem ------------------------------------------------------------
+
+    def _solver_inputs(self, player: str, move: dict[str, Any]) -> tuple[str, str] | None:
+        """Wejście solvera dla ruchu w rozgrywce (z wiedzy gracza w chwili decyzji)."""
+        if not self.analysis or self.game.phase != Phase.PLAY or move.get("action") not in ("play_card", "meld"):
+            return None
+        seed = (zlib.crc32(f"{self.id}:{len(self.log)}".encode()) & 0x7FFFFFFF) or 1   # powtarzalne ziarno
+        try:
+            return (build_q_input(self.game, player, move, samples=SOLVER.samples, seed=seed),
+                    build_q_input(self.game, player, move, samples=SOLVER.samples, seed=seed, use_voids=False))
+        except ValueError as exc:
+            logger.warning("Nie da się przygotować analizy ruchu: %s", exc)
+            return None
+
     def _record(self, player: str, observation: dict[str, Any], move: dict[str, Any], reasoning: str,
-                meta: dict[str, Any]) -> None:
+                meta: dict[str, Any], solver_inputs: tuple[str, str] | None = None) -> None:
         usage = meta.get("usage") or {}
         self.log.append({
             "seq": len(self.log) + 1,
@@ -329,7 +375,16 @@ class Match:
             "tokens": (usage.get("prompt_tokens") or 0) + (usage.get("completion_tokens") or 0),
             "ms": meta.get("ms"),
             "context_id": meta.get("context_id"),
+            "analysis": None,
         })
+        if solver_inputs and SOLVER.available:
+            entry = self.log[-1]
+            entry["analysis"] = {"status": "pending"}
+
+            def done(result: dict[str, Any], entry: dict[str, Any] = entry) -> None:
+                entry["analysis"] = result          # przypisanie słownika – atomowe w CPython
+
+            SOLVER.submit(solver_inputs[0], solver_inputs[1], done)
 
     def _set_error(self, kind: str, message: str, player: str, observation: dict[str, Any]) -> None:
         self.status = "error"
@@ -352,7 +407,7 @@ class Match:
             if self.human and self.in_progress:
                 raise ArenaError(403, "Widok sędziego (karty obu graczy) jest zablokowany, dopóki w partii "
                                       "gra człowiek. Użyj widoku swojego gracza.")
-            return self._base_view(judge=True) | {"viewer": "spectator", "judge": self._judge_view()}
+            return self._base_view(judge=True, viewer="spectator") | {"viewer": "spectator", "judge": self._judge_view()}
         if viewer not in PLAYERS:
             raise ArenaError(400, f"Nieznany widok {viewer!r}.")
         if viewer != self.human:
@@ -360,18 +415,25 @@ class Match:
         if not token or not secrets.compare_digest(token, self.human_token or ""):
             raise ArenaError(403, "Niepoprawny token gracza.")
         observation = g.get_state(viewer)
-        return self._base_view(judge=False) | {"viewer": viewer, "observation": observation,
-                                               "your_turn": g.current_player == viewer and self.in_progress}
+        view = self._base_view(judge=self.open_cards, viewer=viewer) | {
+            "viewer": viewer, "observation": observation,
+            "your_turn": g.current_player == viewer and self.in_progress}
+        if self.open_cards:   # świadomie wybrany tryb jawny (sandbox): człowiek widzi to co sędzia
+            view["judge"] = self._judge_view()
+        return view
 
-    def _base_view(self, judge: bool) -> dict[str, Any]:
+    def _base_view(self, judge: bool, viewer: str) -> dict[str, Any]:
         g, r = self.game, self.game.round
         current_round = r.number
         log = []
         for entry in self.log:
             e = dict(entry)
-            # Człowiek nie widzi uzasadnień bota z trwającego rozdania (mogłyby zdradzać karty).
+            # Człowiek nie widzi uzasadnień ani analizy ruchów bota z trwającego rozdania
+            # (mogłyby zdradzać karty bota) – chyba że gra z jawnymi kartami.
             if not judge and e["player"] != self.human and e["round"] == current_round and self.in_progress:
                 e["reasoning"] = "(ukryte do końca rozdania)" if e["reasoning"] else ""
+                if e.get("analysis"):
+                    e["analysis"] = {"status": "hidden"}
             log.append(e)
         seats = {}
         for p, s in self.seats.items():
@@ -411,6 +473,10 @@ class Match:
             },
             "log": log,
             "round_results": [e["public"] for e in g._log if e["public"]["action"] == "round_end"],
+            "open_cards": self.open_cards,
+            "analysis_enabled": self.analysis,
+            "solver": SOLVER.status() if self.analysis else None,
+            "analysis_summary": _summary(log),
         }
 
     def _judge_view(self) -> dict[str, Any]:
@@ -431,6 +497,24 @@ class Match:
             "legal_moves": g.legal_moves(g.current_player) if g.current_player else [],
             "bot_observations": {p: ch.last_observation for p, ch in self.channels.items() if ch},
         }
+
+
+def _summary(log: list[dict[str, Any]]) -> dict[str, Any]:
+    """Jakość gry według solvera: średnia strata i odsetek ruchów optymalnych (z widocznych wpisów)."""
+    out: dict[str, Any] = {}
+    for p in PLAYERS:
+        done = [e["analysis"] for e in log if e["player"] == p and (e.get("analysis") or {}).get("status") == "done"
+                and e["analysis"].get("loss") is not None]
+        losses = [a["loss"] for a in done]
+        out[p] = {
+            "analysed": len(losses),
+            "pending": sum(1 for e in log if e["player"] == p and (e.get("analysis") or {}).get("status") == "pending"),
+            "total_loss": round(sum(losses), 1),
+            "avg_loss": round(sum(losses) / len(losses), 2) if losses else None,
+            "optimal": sum(1 for x in losses if x < 0.5),
+            "worst": max(losses) if losses else None,
+        }
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +551,8 @@ class ArenaService:
         humans = [p for p, s in req.seats.items() if s.kind == "human"]
         if len(humans) > 1:
             raise ArenaError(400, "Człowiekiem może sterować najwyżej jeden gracz.")
+        if req.open_cards and (req.mode != "sandbox" or not humans):
+            raise ArenaError(400, "Jawne karty są dostępne tylko w sandboxie z graczem-człowiekiem.")
 
         # --- kanały: każdy gracz-bot dostaje WŁASNY, odizolowany kontekst ------------
         channels: dict[str, BotChannel | HeuristicChannel | None] = {}
@@ -503,7 +589,8 @@ class ArenaService:
 
         self._gc()
         match = Match(id=match_id, mode=req.mode, game=game, seats=req.seats, channels=channels,
-                      max_rounds=req.max_rounds, warnings=warnings)
+                      max_rounds=req.max_rounds, warnings=warnings, open_cards=req.open_cards,
+                      analysis=req.analysis and SOLVER.available)
         if humans:
             match.human = humans[0]
             match.human_token = secrets.token_urlsafe(24)
@@ -526,6 +613,15 @@ class ArenaService:
         match = self.get(match_id)
         match.human_move(token, move)
         return match.view(match.human or "spectator", token)
+
+    def set_open_cards(self, match_id: str, token: str | None, value: bool) -> dict[str, Any]:
+        match = self.get(match_id)
+        match.set_open_cards(token, value)
+        return match.view(match.human or "spectator", token)
+
+    @staticmethod
+    def solver_status() -> dict[str, Any]:
+        return SOLVER.status()
 
     def delete(self, match_id: str) -> None:
         self.matches.pop(match_id, None)
