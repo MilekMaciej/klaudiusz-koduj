@@ -239,6 +239,8 @@ class Match:
     human_token: str | None = None
     open_cards: bool = False
     analysis: bool = False
+    #: wejścia solvera dla wpisów dziennika (seq -> (wejście, wejście zapasowe)) – do ponowienia analizy
+    solver_inputs: dict[int, tuple[str, str]] = field(default_factory=dict, repr=False)
     warnings: list[str] = field(default_factory=list)
     log: list[dict[str, Any]] = field(default_factory=list)
     status: str = "running"
@@ -344,20 +346,40 @@ class Match:
 
     # --- analiza solverem ------------------------------------------------------------
 
-    def _solver_inputs(self, player: str, move: dict[str, Any]) -> tuple[str, str] | None:
-        """Wejście solvera dla ruchu w rozgrywce (z wiedzy gracza w chwili decyzji)."""
+    def _solver_inputs(self, player: str, move: dict[str, Any]) -> tuple[str, str] | dict[str, Any] | None:
+        """
+        Wejście solvera dla ruchu w rozgrywce (z wiedzy gracza w chwili decyzji).
+        None = ruch nie podlega analizie; dict = opis błędu (ruch i tak się wykona).
+        """
         if not self.analysis or self.game.phase != Phase.PLAY or move.get("action") not in ("play_card", "meld"):
             return None
         seed = (zlib.crc32(f"{self.id}:{len(self.log)}".encode()) & 0x7FFFFFFF) or 1   # powtarzalne ziarno
         try:
             return (build_q_input(self.game, player, move, samples=SOLVER.samples, seed=seed),
                     build_q_input(self.game, player, move, samples=SOLVER.samples, seed=seed, use_voids=False))
-        except ValueError as exc:
-            logger.warning("Nie da się przygotować analizy ruchu: %s", exc)
-            return None
+        except Exception as exc:  # noqa: BLE001 – przygotowanie analizy nigdy nie blokuje ruchu
+            logger.exception("Nie da się przygotować wejścia solvera dla ruchu %s gracza %s", move, player)
+            return {"status": "error", "kind": "input", "title": "Niepoprawne dane dla solvera",
+                    "message": f"nie udało się zbudować obserwacji dla solvera: {type(exc).__name__}: {exc}",
+                    "retryable": False}
+
+    def retry_analysis(self, seq: int) -> None:
+        """Ponowna analiza wpisu dziennika (np. po chwilowej awarii solvera)."""
+        entry = next((e for e in self.log if e["seq"] == seq), None)
+        if entry is None:
+            raise ArenaError(404, f"Brak ruchu nr {seq}.")
+        inputs = self.solver_inputs.get(seq)
+        if not inputs:
+            raise ArenaError(400, "Tego ruchu nie da się przeanalizować (to nie ruch w rozgrywce albo brak danych).")
+        if (entry.get("analysis") or {}).get("status") == "pending":
+            return
+        if not SOLVER.available:
+            raise ArenaError(503, f"Solver niedostępny: {SOLVER.reason}")
+        entry["analysis"] = {"status": "pending"}
+        SOLVER.submit(inputs[0], inputs[1], lambda result, entry=entry: entry.__setitem__("analysis", result))
 
     def _record(self, player: str, observation: dict[str, Any], move: dict[str, Any], reasoning: str,
-                meta: dict[str, Any], solver_inputs: tuple[str, str] | None = None) -> None:
+                meta: dict[str, Any], solver_inputs: tuple[str, str] | dict[str, Any] | None = None) -> None:
         usage = meta.get("usage") or {}
         self.log.append({
             "seq": len(self.log) + 1,
@@ -377,14 +399,20 @@ class Match:
             "context_id": meta.get("context_id"),
             "analysis": None,
         })
-        if solver_inputs and SOLVER.available:
-            entry = self.log[-1]
+        entry = self.log[-1]
+        if isinstance(solver_inputs, dict):           # nie udało się przygotować wejścia – pokaż powód
+            entry["analysis"] = solver_inputs
+        elif solver_inputs and SOLVER.available:
+            self.solver_inputs[entry["seq"]] = solver_inputs
             entry["analysis"] = {"status": "pending"}
 
             def done(result: dict[str, Any], entry: dict[str, Any] = entry) -> None:
                 entry["analysis"] = result          # przypisanie słownika – atomowe w CPython
 
             SOLVER.submit(solver_inputs[0], solver_inputs[1], done)
+        elif solver_inputs:
+            entry["analysis"] = {"status": "unavailable", "kind": "unavailable",
+                                 "message": SOLVER.reason, "retryable": False}
 
     def _set_error(self, kind: str, message: str, player: str, observation: dict[str, Any]) -> None:
         self.status = "error"
@@ -513,6 +541,8 @@ def _summary(log: list[dict[str, Any]]) -> dict[str, Any]:
             "avg_loss": round(sum(losses) / len(losses), 2) if losses else None,
             "optimal": sum(1 for x in losses if x < 0.5),
             "worst": max(losses) if losses else None,
+            "errors": sum(1 for e in log if e["player"] == p
+                          and (e.get("analysis") or {}).get("status") in ("error", "unavailable")),
         }
     return out
 
@@ -613,6 +643,11 @@ class ArenaService:
         match = self.get(match_id)
         match.human_move(token, move)
         return match.view(match.human or "spectator", token)
+
+    def retry_analysis(self, match_id: str, seq: int, viewer: str, token: str | None) -> dict[str, Any]:
+        match = self.get(match_id)
+        match.retry_analysis(seq)
+        return match.view(viewer, token)
 
     def set_open_cards(self, match_id: str, token: str | None, value: bool) -> dict[str, Any]:
         match = self.get(match_id)

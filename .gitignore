@@ -1,2 +1,11 @@
+# środowisko
 .venv/
 .env
+__pycache__/
+*.pyc
+
+# solver C++ – plik wykonywalny budowany lokalnie (python -m solver.build), zależny od systemu/CPU
+solver/bin/
+
+# wejścia solvera, które wywołały błąd (diagnostyka)
+logs/

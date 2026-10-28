@@ -11,7 +11,7 @@ python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\a
 pip install -r requirements.txt
 cp .env.example .env            # ustaw LLM_PROVIDER i klucz (Groq i Gemini są darmowe, ChatGPT płatny)
 python -m backend.llm_config --ping                    # sprawdza klucze i modele
-python -m solver.build                                 # kompiluje solver C++ (opcjonalnie – serwer zrobi to sam)
+python -m solver.build                                 # kompiluje i testuje solver C++ (serwer zrobi to sam)
 uvicorn backend.main:app --reload                      # uruchamiać z katalogu głównego projektu
 ```
 
@@ -80,6 +80,24 @@ Zasada beczki (800+) nie jest modelowana, bo solver ocenia pojedyncze rozdanie.
 
 Ręczne użycie: `python run_battle.py --transport direct --analyse` albo bezpośrednio
 `solver/bin/tysiac_solver q plik.txt` (format wejścia opisany w nagłówku pliku C++).
+
+### Gdy analiza zgłasza błąd
+
+Przy ruchu widać wtedy kategorię błędu i jego przyczynę. Po rozwinięciu „szczegóły techniczne” są kod wyjścia
+procesu, `stderr` solvera i ścieżka do zapisanego wejścia. Te same informacje trafiają do logów serwera
+(`backend.solver`).
+
+| Komunikat | Przyczyna | Co zrobić |
+|---|---|---|
+| `SIGILL` / `0xC000001D` | plik zbudowany z `-march=native` na innym procesorze | `python -m solver.build --force` (serwer robi to sam przy starcie) |
+| `0xC0000135` | Windows/MinGW: brak `libstdc++-6.dll` | przebudowa (teraz linkowanie statyczne) |
+| `SIGSEGV`, `SIGKILL` | crash lub brak pamięci | zmniejsz `SOLVER_TT_BITS` / `SOLVER_THREADS` |
+| „solver nie zwrócił JSON-a” | stary plik wykonywalny | `python -m solver.build --force` |
+| Niepoprawne dane / niespójna sytuacja | wejście odrzucone przez walidację (Python lub C++) | zgłoś plik z `logs/solver/` |
+
+Każde wejście, które wywołało błąd, jest zapisywane w `logs/solver/fail-*.txt` i można je odtworzyć:
+`solver/bin/tysiac_solver q logs/solver/<plik>.txt`. Po awarii procesu backend raz przebudowuje
+solver i ponawia analizę. W interfejsie analizę ruchu można ponowić przyciskiem „ponów analizę”.
 
 ## Izolacja botów (anti-cheat)
 

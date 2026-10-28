@@ -274,6 +274,13 @@ async def match_visibility(match_id: str, payload: dict[str, Any] = Body(...),
     return arena.set_open_cards(match_id, x_player_token, bool(payload.get("open")))
 
 
+@app.post("/api/matches/{match_id}/analysis/{seq}")
+async def match_retry_analysis(match_id: str, seq: int, viewer: str = "spectator",
+                               x_player_token: str | None = Header(default=None)) -> dict[str, Any]:
+    """Ponowna analiza ruchu nr `seq` solverem C++ (np. po chwilowej awarii)."""
+    return arena.retry_analysis(match_id, seq, viewer, x_player_token)
+
+
 @app.delete("/api/matches/{match_id}")
 async def match_delete(match_id: str) -> dict[str, str]:
     arena.delete(match_id)

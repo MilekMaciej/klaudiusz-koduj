@@ -197,3 +197,89 @@ def parse_q_output(data: dict[str, Any]) -> dict[str, Any]:
         out["q"] = out["model"]["q"]
         out["loss"] = out["model"]["loss"]
     return out
+
+
+# ---------------------------------------------------------------------------
+# Walidacja wejścia (zanim trafi do procesu C++)
+# ---------------------------------------------------------------------------
+
+class SolverInputError(ValueError):
+    """Wejście dla solvera jest niepoprawne lub niespójne – nie wysyłamy go do C++."""
+
+
+_VALID_CARD = {s + r for s in "SCDH" for r in "9WDKTA"}
+
+
+def parse_kv(text: str) -> dict[str, list[str]]:
+    """Ten sam format co readKV w C++: linia = klucz + wartości oddzielone spacjami, '#' = komentarz."""
+    kv: dict[str, list[str]] = {}
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        key, *values = line.split()
+        kv[key] = values
+    return kv
+
+
+def validate_q_input(text: str) -> dict[str, list[str]]:
+    """
+    Sprawdza wejście trybu q dokładnie tak, jak zinterpretuje je readKV/modeQ w C++.
+    Rzuca SolverInputError z czytelnym opisem; zwraca sparsowane pola.
+    """
+    kv = parse_kv(text)
+    required = ("declarer", "contract", "actor", "hand", "unseen", "opp_size", "hidden_dead",
+                "led", "trump", "tn", "samples")
+    missing = [k for k in required if k not in kv]
+    if missing:
+        raise SolverInputError(f"brak pól: {', '.join(missing)}")
+
+    def ints(key: str) -> list[int]:
+        try:
+            return [int(v) for v in kv[key]]
+        except ValueError:
+            raise SolverInputError(f"pole '{key}' musi zawierać liczby całkowite: {kv[key]}") from None
+
+    def cards(key: str) -> list[str]:
+        values = [v for v in kv.get(key, []) if v != "-"]
+        bad = [v for v in values if v not in _VALID_CARD]
+        if bad:
+            raise SolverInputError(f"pole '{key}': niepoprawne karty {bad} (format solvera: kolor SCDH + ranga 9WDKTA)")
+        if len(set(values)) != len(values):
+            raise SolverInputError(f"pole '{key}': powtórzone karty")
+        return values
+
+    for key in ("declarer", "contract", "actor", "opp_size", "hidden_dead", "tn", "samples"):
+        if len(kv[key]) != 1:
+            raise SolverInputError(f"pole '{key}' musi mieć dokładnie jedną wartość")
+    declarer, contract, actor = ints("declarer")[0], ints("contract")[0], ints("actor")[0]
+    opp_size, hidden_dead, tn, samples = ints("opp_size")[0], ints("hidden_dead")[0], ints("tn")[0], ints("samples")[0]
+    hidden_disc = ints("hidden_disc")[0] if kv.get("hidden_disc") else 0
+    hand, unseen = cards("hand"), cards("unseen")
+    led = cards("led")
+    if declarer not in (0, 1) or actor not in (0, 1):
+        raise SolverInputError("declarer i actor muszą być 0 lub 1")
+    if contract <= 0 or contract % 10:
+        raise SolverInputError(f"kontrakt {contract} musi być dodatnią wielokrotnością 10")
+    if not hand:
+        raise SolverInputError("pusta ręka gracza – nie ma czego oceniać")
+    if set(hand) & set(unseen):
+        raise SolverInputError(f"te same karty w ręce i w unseen: {sorted(set(hand) & set(unseen))}")
+    if len(led) > 1 or (led and (led[0] in hand or led[0] in unseen)):
+        raise SolverInputError("karta wyjścia (led) musi być jedna i nie może być w ręce ani w unseen")
+    if opp_size != len(hand) - (1 if led else 0):
+        raise SolverInputError(f"opp_size={opp_size} nie pasuje do ręki ({len(hand)} kart"
+                               f"{', przeciwnik już wyszedł' if led else ''})")
+    if hidden_dead != len(unseen) - opp_size:
+        raise SolverInputError(f"hidden_dead={hidden_dead}, a unseen − opp_size = {len(unseen) - opp_size}")
+    if not 0 <= hidden_disc <= hidden_dead:
+        raise SolverInputError("hidden_disc musi być w zakresie 0..hidden_dead")
+    if not 0 <= tn <= 9 or samples < 1:
+        raise SolverInputError("tn musi być w zakresie 0..9, samples ≥ 1")
+    if kv["trump"] and kv["trump"][0] not in ("S", "C", "D", "H", "-"):
+        raise SolverInputError(f"zły atut {kv['trump'][0]!r} (S/C/D/H lub -)")
+    if len(hand) + len(unseen) + len(led) > 24:
+        raise SolverInputError("więcej niż 24 karty w obserwacji")
+    model = kv.get("model") or []
+    if model and model[0] not in hand:
+        raise SolverInputError(f"oceniany ruch {model[0]} nie jest w ręce gracza")
+    return kv

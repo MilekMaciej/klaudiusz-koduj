@@ -328,3 +328,6 @@ button.ghost { background: transparent; }
 .qtable tr.best td:first-child::after { content: " ★"; color: var(--accent); }
 .qtable .red { color: var(--red); }
 @media (max-width: 720px) { .vis-options { grid-template-columns: 1fr; } }
+
+.analysis-error { border-left: 2px solid var(--error-border); padding-left: 6px; }
+.analysis-error .json { max-height: 140px; margin-top: 4px; }

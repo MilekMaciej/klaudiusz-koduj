@@ -497,11 +497,11 @@ function renderQuality(v) {
   box.hidden = false;
   const rows = ["A", "B"].map((p) => {
     const s = v.analysis_summary[p];
-    const text = s.analysed
+    const text = s.analysed && isNum(s.avg_loss)
       ? `śr. strata ${s.avg_loss.toFixed(1)} · optymalne ${s.optimal}/${s.analysed}`
       : "brak ocenionych ruchów";
     return el("div", { class: "row" }, el("span", { text: seatName(v, p) }),
-      el("b", { text: text + (s.pending ? ` · liczę ${s.pending}` : "") }));
+      el("b", { text: text + (s.pending ? ` · liczę ${s.pending}` : "") + (s.errors ? ` · błędy analizy: ${s.errors}` : "") }));
   });
   box.replaceChildren(el("div", { class: "note", text: "Jakość ruchów w rozgrywce wg solvera C++ (double-dummy):" }), ...rows);
 }
@@ -513,24 +513,52 @@ const Q_HELP = "Q = średnia wartość rozdania (wynik rozgrywającego − obro�
   "optymalnej grze double-dummy, w losowych układach kart zgodnych z tym, co gracz wiedział. " +
   "Strata = max Q − Q zagranego ruchu.";
 
-function renderAnalysis(a) {
+const isNum = (x) => typeof x === "number" && Number.isFinite(x);
+
+function renderAnalysisError(a, e) {
+  const title = a.title || (a.status === "unavailable" ? "Solver niedostępny" : "Błąd analizy");
+  const details = [
+    a.kind ? `kategoria: ${a.kind}` : null,
+    a.exit_code !== undefined && a.exit_code !== null ? `kod wyjścia: ${a.exit_code}` : null,
+    a.input_file ? `wejście zapisane: ${a.input_file}` : null,
+  ].filter(Boolean);
+  return el("div", { class: "analysis analysis-error" },
+    el("div", { class: "line" }, el("span", { class: "badge bad", text: `⚠ ${title}` }),
+      a.retryable && e ? el("button", { type: "button", class: "link-btn", onclick: () => retryAnalysis(e.seq) }, "ponów analizę") : null),
+    el("div", { text: a.message || "brak opisu błędu – sprawdź logi serwera" }),
+    details.length || a.stderr ? el("details", {}, el("summary", { text: "szczegóły techniczne" }),
+      el("div", { class: "muted", text: details.join(" · ") }),
+      a.stderr ? el("pre", { class: "json", text: a.stderr }) : null) : null);
+}
+
+async function retryAnalysis(seq) {
+  try {
+    app.view = await api(`/api/matches/${app.matchId}/analysis/${seq}?viewer=${app.viewer}`, { method: "POST", token: app.token });
+    renderGame();
+  } catch (err) { showGameError({ kind: "http", message: err.message }); }
+}
+
+function renderAnalysis(a, e) {
   if (!a) return null;
   if (a.status === "pending") return el("div", { class: "analysis" }, el("div", { class: "line" }, el("span", { class: "badge wait", text: "⏳ solver liczy…" })));
   if (a.status === "hidden") return el("div", { class: "analysis" }, el("div", { class: "line" }, el("span", { class: "badge wait", text: "analiza ukryta do końca rozdania" })));
-  if (a.status !== "done") return el("div", { class: "analysis muted", text: `analiza niedostępna: ${a.message || a.status}` });
-  const loss = a.loss ?? 0;
+  if (a.status !== "done") return renderAnalysisError(a, e);
+  if (!isNum(a.q) || !isNum(a.loss) || !isNum(a.max_q) || !a.best || !Array.isArray(a.moves)) {
+    return renderAnalysisError({ title: "Niepełny wynik solvera", message: "brakuje Q, straty albo listy ruchów", kind: "bad_output", retryable: true }, e);
+  }
+  const loss = a.loss;
   const cls = loss < 0.5 ? "ok" : loss < 10 ? "mid" : "bad";
   const line = el("div", { class: "line", title: Q_HELP },
     el("span", { class: `badge ${cls}`, text: loss < 0.5 ? "✓ optymalny" : `strata ${loss.toFixed(1)}` }),
     el("span", { text: `Q ${fmtQ(a.q)}` }),
     loss >= 0.5 ? el("span", { text: `· najlepszy ${moveLabel(a.best)} (Q ${fmtQ(a.max_q)})` }) : null);
-  const table = el("table", { class: "qtable" }, a.moves.map((m) => el("tr", {
+  const table = el("table", { class: "qtable" }, a.moves.filter((m) => m && m.card && isNum(m.q)).map((m) => el("tr", {
     class: [sameMove(m, a.model) && "played", sameMove(m, a.best) && "best"].filter(Boolean).join(" ") || null,
   }, el("td", { class: cardParts(m.card).red ? "red" : null, text: moveLabel(m) }),
-     el("td", { text: `Q ${fmtQ(m.q)}` }), el("td", { class: "muted", text: `±${m.se.toFixed(1)}` }),
+     el("td", { text: `Q ${fmtQ(m.q)}` }), el("td", { class: "muted", text: isNum(m.se) ? `±${m.se.toFixed(1)}` : "" }),
      el("td", { text: a.max_q - m.q < 0.05 ? "–" : `−${(a.max_q - m.q).toFixed(1)}` }))));
   return el("div", { class: "analysis" }, line,
-    el("details", {}, el("summary", { text: `Q wszystkich ruchów (${a.worlds} światów, ${Math.round(a.solver_ms)} ms)` }), table));
+    el("details", {}, el("summary", { text: `Q wszystkich ruchów (${a.worlds ?? "?"} światów, ${isNum(a.solver_ms) ? Math.round(a.solver_ms) : "?"} ms)` }), table));
 }
 
 function renderSeat(v, p, judge, obs, position) {
@@ -689,7 +717,7 @@ function renderLog(v) {
       el("div", { class: "where", text: `R${e.round} · ${PHASE_PL[e.phase] || e.phase}` }),
       el("div", {}, el("span", { class: "who", text: `${seatName(v, e.player)}: ` }), e.text),
       e.reasoning ? el("div", { class: "why", text: e.reasoning.startsWith("(") ? e.reasoning : `„${e.reasoning}”` }) : null,
-      renderAnalysis(e.analysis),
+      renderAnalysis(e.analysis, e),
       el("div", { class: "meta", text: meta })));
   }
   if (lastRound !== null && lastRound !== v.round) pushResult(lastRound);

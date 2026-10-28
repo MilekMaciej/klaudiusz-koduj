@@ -14,7 +14,11 @@
 //   * obserwacja (tryb q): hidden_disc N (ile ukrytych kart martwych to odłożone karty
 //     rozgrywającego) i not_unused <karty> (karty, które nie mogą być w niewybranym musiku),
 //   * tryb q: "output json" – wynik jako JSON dla backendu (zamiast tekstu printQ),
-//   * selftest losuje także nowe flagi.
+//   * selftest losuje także nowe flagi,
+//   * [odporność] walidacja wejścia trybu q z czytelnymi komunikatami, wyjątki z wątków
+//     roboczych przekazywane do main (zamiast std::terminate), przy "output json" każdy
+//     błąd trafia też na stdout jako {"error": "...", "code": "..."}; kody wyjścia:
+//     0 = OK, 2 = błąd danych/obliczeń (opis na stderr), 1 = złe argumenty.
 //
 // Tryby:
 //   tysiac_solver solve <plik|->            wartość dokładna stanu o pełnej informacji
@@ -47,6 +51,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <sstream>
@@ -75,13 +80,21 @@ static const char* RANKS = "9WDKTA";            // T = dziesiątka
 static const u32 SM[4]   = {0x3Fu, 0x3Fu << 6, 0x3Fu << 12, 0x3Fu << 18};
 static const int INF = 30000;
 
+// [odporność] błąd z kodem kategorii (dla backendu): input = niepoprawne dane wejściowe,
+// inconsistent = dane poprawne składniowo, ale niespójne (np. rozmiary rąk), internal = inne.
+struct SolverError : runtime_error {
+    string code;
+    SolverError(const string& c, const string& m) : runtime_error(m), code(c) {}
+};
+static bool g_json = false;                       // czy wejście zażądało "output json"
+
 static inline int sOf(int c) { return c / 6; }
 static inline int rOf(int c) { return c % 6; }
 static string cname(int c) { string s; s += SUITS[sOf(c)]; s += RANKS[rOf(c)]; return s; }
 static int cid(const string& s) {
-    if (s.size() != 2) throw runtime_error("zła karta: " + s);
+    if (s.size() != 2) throw SolverError("input", "zła karta: '" + s + "' (oczekiwano np. HA, ST, C9)");
     const char* p = strchr(SUITS, s[0]); const char* q = strchr(RANKS, s[1]);
-    if (!p || !q) throw runtime_error("zła karta: " + s);
+    if (!p || !q || !s[0] || !s[1]) throw SolverError("input", "zła karta: '" + s + "' (kolor S/C/D/H, ranga 9/W/D/K/T/A)");
     return int(p - SUITS) * 6 + int(q - RANKS);
 }
 
@@ -312,12 +325,13 @@ static QRes runQ(const Obs& o, const Cfg& cf, int N, int seed, int threads, int 
     Mv mv[32]; int nm = genMoves(probe, cf, mv, -1);
     vector<Mv> moves(mv, mv + nm);
     sort(moves.begin(), moves.end(), [](Mv a, Mv b) { return a.c * 2 + a.meld < b.c * 2 + b.meld; });
-    { mt19937_64 r(1); u32 om; int pp[2], dd; if (!sampleWorld(o, cf, r, om, pp, dd)) throw runtime_error("niespójna obserwacja (rozmiary ręki/voidy/martwe karty)"); }
+    { mt19937_64 r(1); u32 om; int pp[2], dd; if (!sampleWorld(o, cf, r, om, pp, dd)) throw SolverError("inconsistent", "niespójna obserwacja (rozmiary ręki/voidy/martwe karty)"); }
     int sign = (o.actor == cf.declarer) ? 1 : -1;
     vector<vector<double>> S(threads, vector<double>(nm, 0)), Q(threads, vector<double>(nm, 0));
     vector<u64> nodes(threads, 0); atomic<int> next{0};
     auto t0 = chrono::steady_clock::now();
-    auto work = [&](int tid) {
+    mutex errMu; string errMsg, errCode;                     // [odporność] pierwszy błąd z wątków
+    auto work = [&](int tid) { try {
         Solver sv(cf, bits);
         for (;;) {
             int w = next++; if (w >= N) break;
@@ -326,7 +340,7 @@ static QRes runQ(const Obs& o, const Cfg& cf, int N, int seed, int threads, int 
             if (!sampleWorld(o, cf, rng, om, pp, dd)) {              // [integracja] rzadkie odrzucenie: nowe ziarno
                 bool ok = false;
                 for (int retry = 1; retry <= 50 && !ok; retry++) { mt19937_64 r2(rng() + retry); ok = sampleWorld(o, cf, r2, om, pp, dd); }
-                if (!ok) { fprintf(stderr, "błąd: nie udało się wylosować świata zgodnego z obserwacją\n"); exit(2); }
+                if (!ok) throw SolverError("inconsistent", "nie udało się wylosować świata zgodnego z obserwacją");
             }
             St root{}; root.h[o.actor] = o.hand; root.h[1 - o.actor] = om;
             root.turn = o.actor; root.led = o.led; root.trump = o.trump; root.tn = o.tn;
@@ -338,9 +352,16 @@ static QRes runQ(const Obs& o, const Cfg& cf, int N, int seed, int threads, int 
             }
         }
         nodes[tid] = sv.nodes;
-    };
+      } catch (const SolverError& e) {
+        lock_guard<mutex> g(errMu); if (errMsg.empty()) { errMsg = e.what(); errCode = e.code; } next = N;
+      } catch (const bad_alloc&) {
+        lock_guard<mutex> g(errMu); if (errMsg.empty()) { errMsg = "brak pamięci na tablicę transpozycji (zmniejsz SOLVER_TT_BITS lub SOLVER_THREADS)"; errCode = "memory"; } next = N;
+      } catch (const exception& e) {
+        lock_guard<mutex> g(errMu); if (errMsg.empty()) { errMsg = e.what(); errCode = "internal"; } next = N;
+      } };
     vector<thread> th; for (int t = 0; t < threads; t++) th.emplace_back(work, t);
     for (auto& t : th) t.join();
+    if (!errMsg.empty()) throw SolverError(errCode, errMsg);
     QRes r; r.moves = moves; r.n = N;
     for (int i = 0; i < nm; i++) {
         double s = 0, q = 0; for (int t = 0; t < threads; t++) { s += S[t][i]; q += Q[t][i]; }
@@ -412,10 +433,16 @@ static int pcardOrNone(const map<string, vector<string>>& kv, const string& k) {
 }
 static int ptrump(const map<string, vector<string>>& kv) {
     auto it = kv.find("trump"); if (it == kv.end() || it->second.empty() || it->second[0] == "-") return -1;
-    const char* p = strchr(SUITS, it->second[0][0]); if (!p) throw runtime_error("zły atut"); return int(p - SUITS);
+    const char* p = strchr(SUITS, it->second[0][0]);
+    if (!p || it->second[0].size() != 1) throw SolverError("input", "zły atut: '" + it->second[0] + "' (S/C/D/H lub -)");
+    return int(p - SUITS);
+}
+static int toInt(const string& v, const string& k) {           // [odporność] czytelny błąd zamiast "stoi"
+    try { size_t pos = 0; int x = stoi(v, &pos); if (pos != v.size()) throw invalid_argument(v); return x; }
+    catch (const exception&) { throw SolverError("input", "pole '" + k + "': oczekiwano liczby całkowitej, jest '" + v + "'"); }
 }
 static int pint(const map<string, vector<string>>& kv, const string& k, int d) {
-    auto it = kv.find(k); return (it == kv.end() || it->second.empty()) ? d : stoi(it->second[0]);
+    auto it = kv.find(k); return (it == kv.end() || it->second.empty()) ? d : toInt(it->second[0], k);
 }
 static Cfg readCfg(const map<string, vector<string>>& kv) {
     Cfg cf; cf.declarer = pint(kv, "declarer", 0); cf.contract = pint(kv, "contract", 100);
@@ -423,7 +450,8 @@ static Cfg readCfg(const map<string, vector<string>>& kv) {
     cf.mustTrump = pint(kv, "musttrump", cf.mustBeat ? 1 : 0) != 0;   // [integracja]
     cf.meldFirst = pint(kv, "meldfirst", 1) != 0;                       // [integracja]
     cf.deadToLast = pint(kv, "dead_to_last", 1) != 0;                   // [integracja]
-    if (cf.contract % 10) throw runtime_error("kontrakt musi być wielokrotnością 10");
+    if (cf.contract % 10 || cf.contract <= 0) throw SolverError("input", "kontrakt musi być dodatnią wielokrotnością 10");
+    if (cf.declarer != 0 && cf.declarer != 1) throw SolverError("input", "declarer musi być 0 lub 1");
     return cf;
 }
 
@@ -518,19 +546,44 @@ static int modeSolve(istream& in) {
 }
 
 static int modeQ(istream& in, int threads, int bits) {
-    auto kv = readKV(in); Cfg cf = readCfg(kv); Obs o;
+    auto kv = readKV(in);
+    g_json = kv.count("output") && !kv["output"].empty() && kv["output"][0] == "json";   // ustaw przed walidacją
+    Cfg cf = readCfg(kv); Obs o;
     o.actor = pint(kv, "actor", 0); o.hand = pmask(kv["hand"]); o.unseen = pmask(kv["unseen"]);
     o.knownOpp = pmask(kv["known_opp"]); o.oppSize = pint(kv, "opp_size", popc32(o.hand));
     for (auto& t : kv["voids"]) { const char* p = strchr(SUITS, t[0]); if (p && t != "-") o.voids |= 1u << (p - SUITS); }
-    auto pv = kv["pts"]; o.p[0] = pv.size() > 0 ? stoi(pv[0]) : 0; o.p[1] = pv.size() > 1 ? stoi(pv[1]) : 0;
+    auto pv = kv["pts"]; o.p[0] = pv.size() > 0 ? toInt(pv[0], "pts") : 0; o.p[1] = pv.size() > 1 ? toInt(pv[1], "pts") : 0;
     o.hiddenDead = pint(kv, "hidden_dead", 0); o.deadKnown = pint(kv, "dead_pts", 0);
     o.led = pcardOrNone(kv, "led"); o.trump = ptrump(kv); o.tn = pint(kv, "tn", 0);
     o.hiddenDisc = pint(kv, "hidden_disc", 0); o.notUnused = pmask(kv["not_unused"]);   // [integracja]
     int N = pint(kv, "samples", 100), seed = pint(kv, "seed", 1);
     string model = kv.count("model") && !kv["model"].empty() ? kv["model"][0] : "";
     bool modelMeld = kv.count("model") && kv["model"].size() > 1;
+    if (!model.empty()) cid(model);                                   // walidacja nazwy karty ruchu
+
+    // [odporność] spójność obserwacji – zamiast crasha czytelny komunikat
+    auto bad = [](const string& m) { throw SolverError("inconsistent", m); };
+    int hs = popc32(o.hand);
+    if (o.actor != 0 && o.actor != 1) throw SolverError("input", "actor musi być 0 lub 1");
+    if (hs == 0) bad("pusta ręka gracza (hand) – nie ma czego oceniać");
+    if (o.hand & o.unseen) bad("ta sama karta jest w 'hand' i 'unseen'");
+    if (o.knownOpp & ~o.unseen) bad("known_opp musi być podzbiorem unseen");
+    if (o.led >= 0 && ((o.hand | o.unseen) >> o.led & 1)) bad("karta wyjścia (led) nie może być w 'hand' ani 'unseen'");
+    if (o.oppSize != hs - (o.led >= 0 ? 1 : 0))
+        bad("opp_size=" + to_string(o.oppSize) + " nie pasuje do ręki (" + to_string(hs) + " kart" +
+            (o.led >= 0 ? ", przeciwnik już wyszedł" : "") + ")");
+    if (o.hiddenDead != popc32(o.unseen) - o.oppSize)
+        bad("hidden_dead=" + to_string(o.hiddenDead) + ", a unseen − opp_size = " + to_string(popc32(o.unseen) - o.oppSize));
+    if (o.hiddenDisc < 0 || o.hiddenDisc > o.hiddenDead) bad("hidden_disc musi być w zakresie 0..hidden_dead");
+    if (o.tn < 0 || o.tn > 9) bad("tn (rozegrane lewy) musi być w zakresie 0..9");
+    if (N < 1 || N > 100000) throw SolverError("input", "samples musi być w zakresie 1..100000");
+    if (threads < 1) threads = 1;
+    if (bits < 10 || bits > 28) throw SolverError("input", "ttbits musi być w zakresie 10..28");
+    { St probe{}; probe.h[o.actor] = o.hand; probe.turn = o.actor; probe.led = o.led; probe.trump = o.trump; probe.tn = o.tn;
+      Mv mv[32]; if (genMoves(probe, cf, mv, -1) == 0) bad("brak legalnych ruchów w tej sytuacji"); }
+
     QRes res = runQ(o, cf, N, seed, threads, bits);
-    if (kv.count("output") && !kv["output"].empty() && kv["output"][0] == "json") {   // [integracja]
+    if (g_json) {   // [integracja]
         printQJson(res, model, modelMeld, !model.empty());
         return 0;
     }
@@ -592,6 +645,18 @@ static int modeSelftest(int n) {
     return bad != 0;
 }
 
+// [odporność] błąd w formacie JSON na stdout (backend czyta go zamiast samego kodu wyjścia)
+static void printErrorJson(const string& code, const string& msg) {
+    string esc;
+    for (char ch : msg) {
+        if (ch == '"' || ch == '\\') { esc += '\\'; esc += ch; }
+        else if ((unsigned char)ch < 0x20) esc += ' ';
+        else esc += ch;
+    }
+    printf("{\"error\": \"%s\", \"code\": \"%s\"}\n", esc.c_str(), code.c_str());
+    fflush(stdout);
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc < 2) { fprintf(stderr, "użycie: solve|q|bench|selftest ...\n"); return 1; }
@@ -608,6 +673,18 @@ int main(int argc, char** argv) {
                                            argc > 4 ? atoi(argv[4]) : 100, argc > 5 ? atoi(argv[5]) : hw);
         if (m == "deal") return modeDeal(argc > 2 ? atoi(argv[2]) : 1234, argc > 3 ? atoi(argv[3]) : 100);
         if (m == "selftest") return modeSelftest(argc > 2 ? atoi(argv[2]) : 3000);
-    } catch (exception& e) { fprintf(stderr, "błąd: %s\n", e.what()); return 2; }
+    } catch (const SolverError& e) {
+        fprintf(stderr, "błąd [%s]: %s\n", e.code.c_str(), e.what());
+        if (g_json) printErrorJson(e.code, e.what());
+        return 2;
+    } catch (const bad_alloc&) {
+        fprintf(stderr, "błąd [memory]: brak pamięci\n");
+        if (g_json) printErrorJson("memory", "brak pamięci (zmniejsz SOLVER_TT_BITS lub SOLVER_THREADS)");
+        return 2;
+    } catch (const exception& e) {
+        fprintf(stderr, "błąd [internal]: %s\n", e.what());
+        if (g_json) printErrorJson("internal", e.what());
+        return 2;
+    }
     return 1;
 }
